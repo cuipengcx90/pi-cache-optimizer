@@ -648,3 +648,38 @@ Preserved PR contributor session semantics, added process-local footer mode that
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Deep review prompt cache key safety
+
+**Date**: 2026-09-20
+**Task**: Deep review prompt cache key safety
+**Branch**: `master`
+
+### Summary
+
+Completed and merged the 2.8.9 prompt-cache-key security review: fixed five P1/P2 transaction, evidence-correlation, and concurrency issues with permanent regression coverage; verified quality gates and archived the completed related tasks.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a0ce9ae` | (see git log) |
+| `dc9be50` | (see git log) |
+| `89ed5b7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
