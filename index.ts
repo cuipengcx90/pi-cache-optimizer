@@ -2602,7 +2602,7 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
 }
 
 function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
-  // Pi 0.86.1 has no native supportsPromptCacheKey compat field. Per-model
+  // Pi 0.87.1 has no native supportsPromptCacheKey compat field. Per-model
   // opt-out is owned by this extension's promptCacheKey.omit configuration;
   // this helper only exposes the transport API gate for fixture consumers.
   return isOpenAICompatibleApi(model?.api);
@@ -4200,7 +4200,7 @@ function buildOpenAIProxyCompatWarningText(key: string, missing: string[]): stri
   const modelsJsonPath = getModelsJsonDisplayPath();
   const lines: string[] = [
     `💡 pi-cache-optimizer: ${key} is a third-party OpenAI-compatible proxy but merged compat lacks ${missing.join(" and ")}.`,
-    `Edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat (at the same level as baseUrl/api/apiKey/models).`,
+    `Run /cache-optimizer fix to preview a confirmed repair (or edit ${modelsJsonPath} -> providers["${providerLabel}"] -> compat manually).`,
     ``,
   ];
 
@@ -5312,7 +5312,12 @@ function notifyCacheCompatIfNeeded(
   const text = adapter?.warningText?.(model);
   if (!adapter || !text) return;
 
-  const key = `${adapter.id}:${modelKey(model)}`;
+  const affinityOnly = adapter.warningText !== undefined &&
+    describeMissingOpenAICompatibleProxyCompat(model).length === 1 &&
+    describeMissingCacheCompatForModel(model).length === 1;
+  const key = affinityOnly
+    ? `proxy-affinity:${model.provider}`
+    : `${adapter.id}:${modelKey(model)}`;
   if (warnedModels.has(key)) return;
   warnedModels.add(key);
 
@@ -7425,6 +7430,50 @@ interface ModelOverrideNodeLocation {
   modelOverrideCompatEnd: number;
 }
 
+interface ProviderCompatNodeLocation {
+  providerObjectBrace: number;
+  providerObjectEnd: number;
+  providerCompatBrace: number;
+  providerCompatEnd: number;
+}
+
+/** Locate a unique provider and its direct compat object without requiring models[]. */
+function locateProviderCompatInJsonc(
+  text: string,
+  providerLabel: string,
+): ProviderCompatNodeLocation | undefined {
+  const clean = stripJsoncComments(text);
+  const rootBrace = skipJsonWhitespace(clean, 0);
+  if (clean[rootBrace] !== "{") return undefined;
+  const providersKey = findJsonObjectKey(clean, rootBrace, "providers");
+  if (!providersKey || providersKey.count !== 1) return undefined;
+  const providersBrace = skipJsonWhitespace(clean, providersKey.valueStart);
+  if (clean[providersBrace] !== "{") return undefined;
+  const providersEnd = findMatchingBracket(clean, providersBrace);
+  if (providersEnd === undefined) return undefined;
+  const providerKey = findJsonObjectKey(clean, providersBrace, providerLabel);
+  if (!providerKey || providerKey.count !== 1 || providerKey.keyStart > providersEnd) return undefined;
+  const providerObjectBrace = skipJsonWhitespace(clean, providerKey.valueStart);
+  if (clean[providerObjectBrace] !== "{") return undefined;
+  const providerObjectEnd = findMatchingBracket(clean, providerObjectBrace);
+  if (providerObjectEnd === undefined || providerObjectEnd > providersEnd) return undefined;
+
+  for (const key of ["models", "modelOverrides"]) {
+    const child = findJsonObjectKey(clean, providerObjectBrace, key);
+    if (child?.count && child.count > 1) return undefined;
+  }
+  const compatKey = findJsonObjectKey(clean, providerObjectBrace, "compat");
+  if (compatKey?.count && compatKey.count > 1) return undefined;
+  if (!compatKey) {
+    return { providerObjectBrace, providerObjectEnd, providerCompatBrace: -1, providerCompatEnd: -1 };
+  }
+  const providerCompatBrace = skipJsonWhitespace(clean, compatKey.valueStart);
+  if (clean[providerCompatBrace] !== "{") return undefined;
+  const providerCompatEnd = findMatchingBracket(clean, providerCompatBrace);
+  if (providerCompatEnd === undefined || providerCompatEnd > providerObjectEnd) return undefined;
+  return { providerObjectBrace, providerObjectEnd, providerCompatBrace, providerCompatEnd };
+}
+
 /** Locate a provider and optional modelOverrides entry without requiring models[]. */
 function locateModelOverrideInJsonc(
   text: string,
@@ -8383,9 +8432,44 @@ function chooseFixPlacement(
   return decision;
 }
 
+type CompatInsertionLocation = Pick<ModelNodeLocation,
+  | "modelObjectBrace"
+  | "compatObjectBrace"
+  | "compatObjectEnd"
+  | "providerObjectBrace"
+  | "providerCompatBrace"
+  | "providerCompatEnd"
+  | "modelOverrideObjectBrace"
+  | "modelOverrideCompatBrace"
+  | "modelOverrideCompatEnd"
+>;
+
+function composeProviderAffinityInsertion(
+  original: string,
+  providerLabel: string,
+): { modifiedText: string; placementLabel: string } | undefined {
+  const location = locateProviderCompatInJsonc(original, providerLabel);
+  if (!location) return undefined;
+  const node: CompatInsertionLocation = {
+    modelObjectBrace: -1,
+    compatObjectBrace: -1,
+    compatObjectEnd: -1,
+    providerObjectBrace: location.providerObjectBrace,
+    providerCompatBrace: location.providerCompatBrace,
+    providerCompatEnd: location.providerCompatEnd,
+    modelOverrideObjectBrace: -1,
+    modelOverrideCompatBrace: -1,
+    modelOverrideCompatEnd: -1,
+  };
+  return {
+    modifiedText: composeFixInsertion(original, node, { sendSessionAffinityHeaders: true }, "provider"),
+    placementLabel: `providers["${providerLabel}"] -> compat (provider level)`,
+  };
+}
+
 function composeFixInsertion(
   original: string,
-  location: ModelNodeLocation,
+  location: CompatInsertionLocation,
   compatKeys: Record<string, unknown>,
   placement: "provider" | "model" | "modelOverride" = "model",
 ): string {
@@ -9464,20 +9548,27 @@ function locateReceiptCompatTarget(
     };
   }
 
+  if (placement === "provider") {
+    const location = locateProviderCompatInJsonc(text, provider);
+    if (!location) return undefined;
+    return {
+      targetExists: true,
+      compatBrace: location.providerCompatBrace,
+      compatEnd: location.providerCompatEnd,
+    };
+  }
   const location = locateModelInJsonc(text, provider, modelId);
   if (!location || location.providerKeyCount !== 1) return undefined;
-  // A changed-file surgical rollback cannot tell which duplicate model object
-  // was the receipt's target. Refuse that ambiguity instead of touching a
-  // later user-added definition. Provider-level changes do not need to inspect
-  // model compat, but duplicate target ids still make the receipt identity
-  // ambiguous and are rejected for both placements.
+  // A changed-file model-scoped rollback cannot tell which duplicate model
+  // object was the receipt's target. Refuse that ambiguity instead of touching
+  // a later user-added definition. Provider-level receipts returned above do
+  // not depend on model-array identity.
   if (location.allModelIds.filter((id) => id === modelId).length !== 1) return undefined;
-  if (placement === "provider" && location.providerCompatKeyCount > 1) return undefined;
-  if (placement === "model" && location.modelCompatKeyCount > 1) return undefined;
+  if (location.modelCompatKeyCount > 1) return undefined;
   return {
     targetExists: location.modelObjectBrace >= 0,
-    compatBrace: placement === "provider" ? location.providerCompatBrace : location.compatObjectBrace,
-    compatEnd: placement === "provider" ? location.providerCompatEnd : location.compatObjectEnd,
+    compatBrace: location.compatObjectBrace,
+    compatEnd: location.compatObjectEnd,
   };
 }
 
@@ -10163,11 +10254,13 @@ export const __internals_for_tests = {
   hasExplicitLongRetentionOptInFromConfig,
   locateModelInJsonc,
   locateModelOverrideInJsonc,
+  locateProviderCompatInJsonc,
   composeFixInsertion,
   selfCheckFix,
   analyzeModelsJsonForMissingEntry,
   composeMissingEntryInsertion,
   composeModelOverrideInsertion,
+  composeProviderAffinityInsertion,
   selfCheckMissingEntryInsertion,
   decideFixPlacement,
   chooseFixPlacement,
@@ -10277,7 +10370,12 @@ export default function (pi: ExtensionAPI) {
       };
     }
     if (isSessionAffinity403Applicable(model) && sendSessionAffinityHeaders403Models.has(key)) {
-      return { providerLabel, modelId: model.id, compatKeys: { sendSessionAffinityHeaders: false } };
+      return {
+        providerLabel,
+        modelId: model.id,
+        compatKeys: { sendSessionAffinityHeaders: false },
+        forceModelLevel: true,
+      };
     }
     return undefined;
   }
@@ -11462,7 +11560,8 @@ export default function (pi: ExtensionAPI) {
         const useConfigReceipt = isActionablePromptCacheKeyConfigReceipt(configReceipt) &&
           configReceipt.provider === model.provider &&
           configReceipt.modelId === model.id &&
-          (!isActionableModelsJsonFixReceipt(modelsReceipt) || modelsReceipt.provider !== model.provider || modelsReceipt.modelId !== model.id || configReceipt.appliedAt >= modelsReceipt.appliedAt);
+          (!isActionableModelsJsonFixReceipt(modelsReceipt) || modelsReceipt.provider !== model.provider ||
+            (modelsReceipt.placement !== "provider" && modelsReceipt.modelId !== model.id) || configReceipt.appliedAt >= modelsReceipt.appliedAt);
         if (useConfigReceipt) {
           if (!cmdCtx.hasUI) {
             cmdCtx.ui.notify("❌ Rollback requires interactive confirmation. No changes were made.\nRun /cache-optimizer rollback in Pi's interactive UI to restore the prompt-cache-key setting.", "warning");
@@ -11505,7 +11604,7 @@ export default function (pi: ExtensionAPI) {
           cmdCtx.ui.notify("ℹ️ No unapplied /cache-optimizer fix receipt was found.", "info");
           return;
         }
-        if (receipt.provider !== model.provider || receipt.modelId !== model.id) {
+        if (receipt.provider !== model.provider || (receipt.placement !== "provider" && receipt.modelId !== model.id)) {
           cmdCtx.ui.notify(
             `ℹ️ The latest fix receipt is for ${receipt.provider}/${receipt.modelId}, not the active model ${model.provider}/${model.id}. ` +
             "Switch to the matching model before running rollback. No changes were made.",
@@ -11743,6 +11842,79 @@ export default function (pi: ExtensionAPI) {
         const location = locateModelInJsonc(originalText, suggestion.providerLabel, suggestion.modelId);
         if (!location) {
           const diagnosis = analyzeModelsJsonForMissingEntry(originalText, suggestion.providerLabel, suggestion.modelId);
+          const parsedOriginal = (() => { try { return parseJsonc(originalText); } catch { return undefined; } })();
+          const provider = asRecord(asRecord(parsedOriginal)?.providers)?.[suggestion.providerLabel];
+          const explicit = resolveExplicitCompatValue(parsedOriginal, suggestion.providerLabel, suggestion.modelId, "sendSessionAffinityHeaders");
+          const targetOverrideLocation = locateModelOverrideInJsonc(
+            originalText, suggestion.providerLabel, suggestion.modelId,
+          );
+          const hasTargetOverride = (targetOverrideLocation?.modelOverrideObjectBrace ?? -1) >= 0;
+          const providerPlan = diagnosis && diagnosis.scenario !== "provider_missing" &&
+            isValidModelsConfigForEffectiveCompat(parsedOriginal) && asRecord(provider) &&
+            Object.keys(suggestion.compatKeys).length === 1 && suggestion.compatKeys.sendSessionAffinityHeaders === true &&
+            !suggestion.forceModelLevel && !hasTargetOverride && explicit === undefined &&
+            getEffectiveCompatValueSource(model, parsedOriginal, "sendSessionAffinityHeaders") === undefined
+              ? composeProviderAffinityInsertion(originalText, suggestion.providerLabel)
+              : undefined;
+          if (providerPlan) {
+            const checkProvider = (writtenText: string): string | null => {
+              try {
+                const changed = parseJsonc(writtenText);
+                if (!isValidModelsConfigForEffectiveCompat(changed)) return "provider config is invalid";
+                if (resolveEffectiveCompatFromConfig(model, changed).sendSessionAffinityHeaders !== true) return "affinity flag is not effective";
+                const reverted = JSON.parse(JSON.stringify(changed)) as Record<string, unknown>;
+                const target = asRecord(asRecord(reverted.providers)?.[suggestion.providerLabel]);
+                const compat = asRecord(target?.compat);
+                if (!target || !compat || compat.sendSessionAffinityHeaders !== true) return "provider affinity key is missing";
+                delete compat.sendSessionAffinityHeaders;
+                const originalCompat = asRecord(asRecord(provider)?.compat);
+                if (!originalCompat) delete target.compat;
+                return JSON.stringify(reverted) === JSON.stringify(parsedOriginal) ? null : "unrelated configuration was altered";
+              } catch { return "invalid provider JSONC"; }
+            };
+            const checkError = checkProvider(providerPlan.modifiedText);
+            if (checkError) {
+              cmdCtx.ui.notify(`❌ Provider-level self-check failed: ${checkError}. No changes were made.`, "error");
+              return;
+            }
+            const backupPath = `${MODELS_JSON_PATH}.backup-cache-optimizer-${backupTimestamp()}`;
+            const confirmed = await cmdCtx.ui.confirm("Cache Optimizer — Fix provider affinity", [
+              `📝 Preview of changes to ${getModelsJsonDisplayPath()}:`,
+              `Location: ${providerPlan.placementLabel}`,
+              `Compat JSON to write: ${JSON.stringify(suggestion.compatKeys)}`,
+              `⚠️ This affects all models using this provider across all sessions; model-level overrides remain authoritative.`,
+              `A timestamped backup will be written to: ${backupPath}`,
+              "Run /reload or restart Pi for the change to take effect.",
+              "Apply these changes?",
+            ].join("\n"));
+            if (!confirmed) {
+              cmdCtx.ui.notify("No changes were made. Canceled by user.", "info");
+              return;
+            }
+            const receipt = createModelsJsonFixReceipt(
+              originalText, providerPlan.modifiedText, suggestion.providerLabel, suggestion.modelId,
+              "provider", suggestion.compatKeys, true, backupPath,
+            );
+            if (!receipt) {
+              cmdCtx.ui.notify("❌ Could not create a privacy-safe fix receipt. No changes were made.", "error");
+              return;
+            }
+            try {
+              const result = await applyModelsJsonFixTransaction(providerPlan.modifiedText, backupPath, checkProvider, {
+                expectedCurrentHash: hashText(originalText), purpose: "fix",
+                onCommitted: async () => writeModelsJsonFixReceipt(receipt),
+              });
+              if ("postCheckError" in result) {
+                cmdCtx.ui.notify(`❌ Post-write self-check failed: ${result.postCheckError}. Backup restored.`, "error");
+                return;
+              }
+              invalidateModelsConfigCache();
+              cmdCtx.ui.notify(`✅ Fix applied to ${getModelsJsonDisplayPath()}.\nBackup saved to: ${backupPath}\nRun /reload or restart Pi.`, "info");
+            } catch (error) {
+              cmdCtx.ui.notify(`❌ Write failed: ${error instanceof Error ? error.message : String(error)}. Backup may be at: ${backupPath}`, "error");
+            }
+            return;
+          }
           if (diagnosis && cmdCtx.hasUI) {
             const overrideLocation = locateModelOverrideInJsonc(
               originalText, suggestion.providerLabel, suggestion.modelId,
