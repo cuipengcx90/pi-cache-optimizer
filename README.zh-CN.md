@@ -262,7 +262,7 @@ Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 V
 - DeepSeek Pi Mono replay compat（仅当已明确配置 `thinkingFormat: "deepseek"` 时使用 `requiresReasoningContentOnAssistantMessages: true`；`/fix` 不会自行推断该 format）
 - OpenAI-compatible proxy session affinity（`openai-completions` 使用 `sendSessionAffinityHeaders: true`）。Pi 0.80.7+ 使用 `sessionAffinityFormat` 控制 `openai-responses` header 形式并自动检测默认值；本扩展不再写入已移除的 `sendSessionIdHeader`。
 
-**范围：** 仅当前 active model。其他渠道需切换模型后再次运行 `fix`。
+**范围：** 从当前 active model 发起修复。仅缺少 affinity 时，如 provider 已有配置项且无更高优先级配置遮挡，可一次写入 provider 级 compat，覆盖其适用模型（包括不在 `models[]` 中的模型）；模型级显式 `false` 仍为 opt-out。其他或有歧义的修复仍按模型处理。
 
 **安全机制：**
 
@@ -274,15 +274,15 @@ Pi 0.80.9+ 已在内置 Kimi Coding、Moonshot AI / 中国区、OpenRouter 和 V
 6. 完全保留 `models.json` 原有访问权限，不主动收紧或放宽（例如 `0600` 保持 `0600`，`0644` 保持 `0644`）
 7. 备份名唯一且不会覆盖已有备份；如果 JSONC 扫描器无法置信定位目标，则回退到手动修改指引
 
-已有的 `modelOverrides[modelId]` 具有 Pi 的最高优先级，因此 `fix` 会直接修复该 entry。对于没有自定义 `models[]` entry 的内置模型或 API-login 模型，`fix` 会创建仅含 compat 的 `modelOverrides` entry，而不会凭空添加自定义模型定义。运行时观察到的 provider 失败也始终写入这一最高优先级 model override，避免 extension-provided runtime compat 遮挡修复。自检会验证完整的 provider → custom model → runtime model → modelOverride 结果；无效的低层写入会被拒绝。
+已有的 `modelOverrides[modelId]` 具有 Pi 的最高优先级，因此 `fix` 会直接修复该 entry。对于没有自定义 `models[]` entry 的内置模型或 API-login 模型，若现有 provider 可安全使用 provider 级 affinity 修复，则优先写入 provider compat；否则 `fix` 会创建仅含 compat 的 `modelOverrides` entry，而不会凭空添加自定义模型定义。运行时观察到的 provider 失败也始终写入这一最高优先级 model override，避免 extension-provided runtime compat 遮挡修复。自检会验证完整的 provider → custom model → runtime model → modelOverride 结果；无效的低层写入会被拒绝。
 
 **非交互模式：** 拒绝写入，显示手动编辑指引。
 
-**运行：** 当 active model 检测到 compat 问题时执行 `/cache-optimizer fix`。compat 已完整时，命令显示"无需修复"。
+**运行：** 当 active model 检测到 compat 问题时执行 `/cache-optimizer fix`。仅缺少 affinity 的提醒按 provider 在当前扩展实例内去重，并指向这一确认式命令；模型专属提醒仍单独显示。compat 已完整时，命令显示"无需修复"。
 
 ## `/cache-optimizer rollback`
 
-Rollback 可通过补全、直接命令和交互菜单使用，并始终需要 UI 确认。命令会选择匹配当前 provider/model 的最新未回滚 receipt，验证备份与文件 hash，创建新的保留访问权限的 rollback backup，并使用临时文件 + 原子替换。Fix 与 rollback 在多个 extension instance 间串行执行；rollback 还会把预览时的 receipt transaction id/hash 绑定到提交阶段，若另一事务替换 receipt 就安全拒绝。没有交互式 UI 时只提供手动恢复指引，不会写入文件。
+Rollback 可通过补全、直接命令和交互菜单使用，并始终需要 UI 确认。命令会选择匹配当前 provider/model（provider 级 receipt 可从同 provider 任一模型操作）的最新未回滚 receipt，验证备份与文件 hash，创建新的保留访问权限的 rollback backup，并使用临时文件 + 原子替换。Fix 与 rollback 在多个 extension instance 间串行执行；rollback 还会把预览时的 receipt transaction id/hash 绑定到提交阶段，若另一事务替换 receipt 就安全拒绝。没有交互式 UI 时只提供手动恢复指引，不会写入文件。
 
 如果 `models.json` 自 fix 后没有变化，rollback 可以恢复完整的 pre-fix JSONC；如果文件发生变化，则绝不会盲目替换整个文件，只会在 receipt-owned scalar key 仍等于记录的 post-fix 值时撤销该 key，并保留之后的用户修改。如果 receipt-owned key 已变化、目标被删除/移动，或 fix 新建了目标项，命令会安全拒绝并指向记录的 backup 供手动检查。成功后 receipt 会标记为已回滚，并需要 `/reload` 或重启。
 
