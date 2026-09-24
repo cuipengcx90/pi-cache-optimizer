@@ -262,7 +262,7 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 - DeepSeek Pi Mono replay compat (`requiresReasoningContentOnAssistantMessages: true` only when `thinkingFormat: "deepseek"` is already explicit; `/fix` never invents that format)
 - OpenAI-compatible proxy session affinity (`sendSessionAffinityHeaders: true` for `openai-completions`). Pi 0.80.7+ controls `openai-responses` header shape with `sessionAffinityFormat` and auto-detects its default; this extension no longer writes the removed `sendSessionIdHeader` field.
 
-**Scope:** only the currently active model. Other channels require switching models and running `fix` again.
+**Scope:** the fix starts from the currently active model. An affinity-only repair can write provider-level compat once for all applicable models on that provider, including models absent from `models[]` when the provider entry already exists and no higher-priority setting shadows it. Explicit per-model `false` remains an opt-out. Other or ambiguous repairs stay model-scoped.
 
 **Safety:**
 
@@ -275,15 +275,15 @@ Pi 0.80.9+ already includes Kimi K3 in built-in Kimi Coding, Moonshot AI / China
 7. Writes a privacy-safe, versioned receipt atomically only after a successful write; the receipt contains transaction/model identity, placement, scalar compat before/after values, file hashes, backup filename, timestamps/status, and no credentials or request data
 8. Uses unique, non-overwriting backup names and falls back to manual guidance if the JSONC scanner cannot confidently locate the target
 
-Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Runtime-observed provider failures are always written to that highest-precedence model override so extension-provided runtime compat cannot shadow the repair. Self-validation checks the full provider → custom model → runtime model → modelOverride result and rejects an ineffective lower-layer edit.
+Existing `modelOverrides[modelId]` entries have Pi's highest precedence, so `fix` repairs them directly. For built-in or API-login models without a custom `models[]` entry, an affinity-only fix prefers provider-level compat when the existing provider is safely locatable and no higher-priority explicit/runtime value shadows it; otherwise `fix` creates a compat-only `modelOverrides` entry instead of inventing a custom model definition. Runtime-observed provider failures are always written to that highest-precedence model override so extension-provided runtime compat cannot shadow the repair. Self-validation checks the full provider → custom model → runtime model → modelOverride result and rejects an ineffective lower-layer edit.
 
 **Non-interactive mode:** refuses to write; shows manual edit guidance instead.
 
-**Run:** `/cache-optimizer fix` when the active model has detected compat issues. The command shows "nothing to fix" when compat is already complete.
+**Run:** `/cache-optimizer fix` when the active model has detected compat issues. Affinity-only missing-compat notifications are shown once per provider per extension instance and point to this confirmed command; model-specific warnings remain separate. The command shows "nothing to fix" when compat is already complete.
 
 ## `/cache-optimizer rollback`
 
-Rollback is available through completion, direct execution, and the interactive menu. It always requires UI confirmation; without an interactive UI it gives manual-review guidance and does not write. The command selects the latest unapplied receipt for the active provider/model, validates the recorded backup and current file hashes, creates a new access-mode-preserving rollback backup, and uses temp-file + atomic rename. Fix and rollback transactions are serialized across extension instances; rollback also binds the receipt transaction id/hash from preview through commit and refuses if another transaction replaces it.
+Rollback is available through completion, direct execution, and the interactive menu. It always requires UI confirmation; without an interactive UI it gives manual-review guidance and does not write. The command selects the latest unapplied receipt for the active provider/model (or any active model on that provider for a provider-level receipt), validates the recorded backup and current file hashes, creates a new access-mode-preserving rollback backup, and uses temp-file + atomic rename. Fix and rollback transactions are serialized across extension instances; rollback also binds the receipt transaction id/hash from preview through commit and refuses if another transaction replaces it.
 
 If `models.json` is unchanged since the fix, rollback can restore the exact pre-fix JSONC. If the file changed, it never blindly replaces it: it may restore only receipt-owned scalar compat keys whose recorded post-fix values are still present, preserving later user changes. If a receipt-owned key changed, the target was removed/moved, or the fix created a new target entry, it refuses and points to the recorded backup for manual review. Successful rollback marks the receipt and requires `/reload` or a restart.
 
