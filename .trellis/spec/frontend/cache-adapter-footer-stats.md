@@ -202,7 +202,7 @@ core's own cache transport.
   persistently listed in the extension-owned config as
   `promptCacheKey.omit`; this removes both request-key spellings, including a
   key already supplied by Pi. Do not add `supportsPromptCacheKey` to Pi's
-  `models.json`, because Pi 0.87.0 does not define that compat field.
+  `models.json`, because Pi 0.87.1 does not define that compat field.
 * All `before_agent_start` prompt mutations (session-overview churn strip,
   skill compression, stable-prefix reorder) can be disabled persistently with:
   `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` (truthy: `1`, `true`, `yes`, `on`).
