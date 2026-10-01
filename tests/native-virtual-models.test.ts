@@ -234,6 +234,70 @@ describe("native virtual model contracts", () => {
 });
 
 describe("native virtual model hooks", () => {
+  test("native virtual requests fail closed instead of reusing stale branch routing", async () => {
+    const { hooks } = setup();
+    const selected = virtualModel();
+    const previous = physical("openai", "shared-model", { api: "openai-responses", baseUrl: "https://api.openai.com/v1" });
+    const direct = physical("anthropic", "shared-model", { api: "anthropic-messages", baseUrl: "https://api.anthropic.com" });
+    const branch = [assistantEntry(previous.provider, previous.id, previous.api)];
+    const result = await hooks.get("before_provider_request")!({
+      payload: { model: direct.id, input: [], prompt_cache_retention: "24h" },
+    }, context(selected, { branch, available: [previous, direct], all: [previous, direct] }));
+
+    assert.equal((result as any)?.prompt_cache_retention, undefined);
+    assert.equal((result as any)?.prompt_cache_key, undefined);
+  });
+
+  test("pi-router-style mirror models do not make a native physical match ambiguous", async () => {
+    const { hooks } = setup();
+    const selected = virtualModel();
+    const physicalModel = physical("fakeproxy", "kimi-k3");
+    const routerMirror = physical("router", "kimi-k3", { api: "pi-router", baseUrl: "https://router.internal" });
+    const resolved = t.resolveNativeVirtualRequestModel(
+      selected as any,
+      { model: "kimi-k3" },
+      context(selected, { available: [physicalModel, routerMirror], all: [physicalModel, routerMirror] }),
+      (candidate: any) => JSON.stringify([candidate.api, candidate.baseUrl]),
+    );
+    assert.equal(resolved?.model.provider, "fakeproxy");
+    assert.equal(resolved?.identityAmbiguous, false);
+
+    const payload = { model: "kimi-k3", messages: [], prompt_cache_key: "pi-key" };
+    const result = await hooks.get("before_provider_request")!({ payload }, context(selected, { available: [physicalModel, routerMirror], all: [physicalModel, routerMirror] }));
+    assert.equal(result, undefined);
+    assert.equal(payload.prompt_cache_key, "pi-key");
+  });
+
+  test("native virtual UX does not consult a pi-router registry adapter", async () => {
+    const { commands } = setup();
+    const notifications: string[] = [];
+    const selected = virtualModel("router", "auto", "Auto");
+    const physicalModel = physical("fakeproxy", "kimi-k3", { name: "Kimi K3" });
+    const registry = Symbol.for("pi.routing.registry.v1");
+    const previous = (globalThis as any)[registry];
+    (globalThis as any)[registry] = {
+      version: 1,
+      registerRouter() { return () => {}; },
+      getRouter() {
+        return {
+          virtualProvider: "router",
+          resolveActiveRoute() { return { virtualProvider: "router", virtualModelId: "auto", provider: "fakeproxy", modelId: "kimi-k3", timestamp: Date.now() }; },
+        };
+      },
+    };
+    try {
+      await commands.get("cache-optimizer")!.handler("doctor", context(selected, {
+        branch: [],
+        all: [physicalModel],
+      }, { notifications }));
+      assert.match(notifications.at(-1) ?? "", /none has answered on this session branch yet/);
+      assert.doesNotMatch(notifications.at(-1) ?? "", /Provider: fakeproxy/);
+    } finally {
+      if (previous === undefined) delete (globalThis as any)[registry];
+      else (globalThis as any)[registry] = previous;
+    }
+  });
+
   test("request hook applies the routed physical model's request policy", async () => {
     const { hooks } = setup();
     const selected = virtualModel();

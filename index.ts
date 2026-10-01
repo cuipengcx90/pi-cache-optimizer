@@ -1297,7 +1297,7 @@ function resolveActiveRouteSnapshot(
   model: PiModel | undefined,
   ctx?: Pick<ExtensionContext, "sessionManager">,
 ): PiRouteSnapshot | undefined {
-  if (!model) return undefined;
+  if (!model || isNativeVirtualModel(model)) return undefined;
   const hint: PiRouteResolveHint | undefined = ctx ? { sessionIdHash: sessionHashFromContext(ctx) } : undefined;
 
   const adapter = getRoutingRegistry()?.getRouter(model.provider);
@@ -1519,7 +1519,10 @@ function getProviderPayloadModelId(payload: unknown): string | undefined {
 }
 
 function physicalModelsWithId(candidates: readonly PiModel[] | undefined, id: string): PiModel[] {
-  return (candidates ?? []).filter((candidate) => candidate.id === id && !isNativeVirtualModel(candidate));
+  return (candidates ?? []).filter((candidate) => candidate.id === id
+    && !isNativeVirtualModel(candidate)
+    && !isRouterModel(candidate)
+    && !getRoutingRegistry()?.getRouter(candidate.provider));
 }
 
 /**
@@ -11297,7 +11300,9 @@ export default function (pi: ExtensionAPI) {
     // model from the dispatched payload. Unresolved requests keep the virtual
     // model, which fails every identity-dependent mutation closed.
     const nativeVirtualRequest = resolveNativeVirtualRequestModel(ctx.model, event.payload, ctx, requestPolicyKey);
-    const requestModel = nativeVirtualRequest?.model ?? resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    const requestModel = isNativeVirtualModel(ctx.model)
+      ? (nativeVirtualRequest?.model ?? ctx.model)
+      : (resolveRouteModel(ctx.model, ctx) ?? ctx.model);
     // Request-local identity is also needed by the always-on Anthropic TTL
     // validity repair, so retain the credential-blind snapshot even while the
     // optional runtime optimizer features are disabled.
