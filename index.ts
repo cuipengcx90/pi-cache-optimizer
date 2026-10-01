@@ -131,6 +131,7 @@ const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+const VIRTUAL_REWRITE_ENV = "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE";
 const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
 type FooterStatsMode = "session" | "total" | "process";
@@ -1332,6 +1333,43 @@ function resolveActiveRouteSnapshot(
     console.warn(`${LOG_PREFIX}: legacy routing global failed`, error);
     return undefined;
   }
+}
+
+function resolveNativeVirtualCandidateModels(
+  model: PiModel | undefined,
+  ctx?: ContextWithOptionalModelRegistry,
+): PiModel[] | undefined {
+  if (!isNativeVirtualModel(model)) return undefined;
+  const adapter = model ? getRoutingRegistry()?.getRouter(model.provider) : undefined;
+  if (!adapter?.resolveCandidateRoutes) return undefined;
+
+  try {
+    const rawSnapshots = adapter.resolveCandidateRoutes(model.id);
+    if (!Array.isArray(rawSnapshots) || rawSnapshots.length === 0) return undefined;
+    const candidates: PiModel[] = [];
+    for (const rawSnapshot of rawSnapshots) {
+      const snapshot = parseRouteSnapshot(rawSnapshot, model.provider, model.id);
+      if (!snapshot) return undefined;
+      const candidate = findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
+        ?? routeSnapshotToPiModel(snapshot, model);
+      if (!isNonEmptyString(candidate.api)) return undefined;
+      candidates.push(candidate);
+    }
+    return candidates;
+  } catch {
+    return undefined;
+  }
+}
+
+function canRewriteNativeVirtualPrompt(
+  model: PiModel | undefined,
+  ctx?: ContextWithOptionalModelRegistry,
+): boolean {
+  if (!isNativeVirtualModel(model) || !isEnabledEnv(process.env[VIRTUAL_REWRITE_ENV])) return false;
+  const candidates = resolveNativeVirtualCandidateModels(model, ctx);
+  return !!candidates?.length && candidates.every((candidate) =>
+    candidate.api === "openai-completions" || candidate.api === "anthropic-messages",
+  ) && candidates.every((candidate) => !isResponsesPromptRewriteBypassApi(candidate.api));
 }
 
 function routeSnapshotToPiModel(snapshot: PiRouteSnapshot, fallback?: PiModel): PiModel {
@@ -10160,6 +10198,8 @@ export const __internals_for_tests = {
   normalizeAnthropicCacheControlTtlOrder,
   isPiBuiltInLlamaCppModel,
   isResponsesPromptRewriteBypassApi,
+  canRewriteNativeVirtualPrompt,
+  VIRTUAL_REWRITE_ENV,
   isMistralConversationsApi,
   isOpenAIFamilyModel,
   isOpenAIFamilyAssistantMessage,
@@ -11202,7 +11242,7 @@ export default function (pi: ExtensionAPI) {
     // after this system prompt is built, so the bypass above cannot be decided
     // here. A route may reach the safety-filtered Codex backend; keep Pi's
     // prompt byte-for-byte instead of reordering it.
-    if (isNativeVirtualModel(_ctx.model)) {
+    if (isNativeVirtualModel(_ctx.model) && !canRewriteNativeVirtualPrompt(_ctx.model, _ctx)) {
       return {};
     }
 
