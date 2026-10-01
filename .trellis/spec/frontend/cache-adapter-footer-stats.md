@@ -760,18 +760,23 @@ resolveNativeVirtualRequestModel(model, payload, ctx, requestPolicyKey?):
   display and context limits. `resolveRouteModel()` returns it for a native
   virtual selection. Use the catalog id `message.model`, not the echoed
   `responseModel`, and look it up in the registry, rejecting registry hits that
-  are themselves virtual.
+  are themselves virtual. Native virtual UX MUST NOT consult the v1 routing
+  registry or legacy router fallback; before the first physical response it
+  remains not applicable.
 * Request hooks resolve the physical model from the payload's dispatched model
   id (`model`; Bedrock `modelId`): first among credentialed physical models
   (`getAvailable()`), then the sticky branch candidates (latest successful,
-  latest of any outcome), then a unique `getAll()` match. An id shared by
-  several providers resolves only when `requestPolicyKey` agrees for all of
-  them (API, official OpenAI endpoint, explicit long-retention opt-in, retention
-  400 history, Anthropic TTL fallback, prompt-cache-key omit), and the lifecycle
-  record is then marked identity-ambiguous.
+  latest of any outcome), then a unique `getAll()` match. Routing shells,
+  including `router/<id>` mirror models exposed by a v1 routing registry, are
+  excluded because they forward requests and do not own the physical payload.
+  An id shared by several providers resolves only when `requestPolicyKey`
+  agrees for all of them (API, official OpenAI endpoint, explicit long-retention
+  opt-in, retention 400 history, Anthropic TTL fallback, prompt-cache-key omit),
+  and the lifecycle record is then marked identity-ambiguous.
 * Unresolved requests keep the virtual model, so identity-dependent mutations
   fail closed: no key injection, no tool ordering, no TTL repair, and
-  `prompt_cache_retention` is stripped by the ordinary safe default.
+  `prompt_cache_retention` is stripped by the ordinary safe default. They MUST
+  NOT fall back to the latest branch route.
 * `before_provider_headers` adds nothing for a native virtual selection.
 * `before_agent_start` performs no prompt mutation for a native virtual
   selection, because a route may reach the safety-filtered Codex backend.
