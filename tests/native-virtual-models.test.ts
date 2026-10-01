@@ -14,6 +14,7 @@ const OPTIMIZER_ENV = [
   "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY",
   "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY",
   "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE",
+  "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE",
   "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION",
   "PI_CACHE_OPTIMIZER_TOOL_ORDER",
   "PI_CACHE_OPTIMIZER_FOOTER_MODE",
@@ -448,6 +449,34 @@ describe("native virtual model hooks", () => {
 
     const routed = await hooks.get("before_agent_start")!(event, context(virtualModel(), { branch: [assistantEntry("proxy", "kimi-k3", "openai-completions")], all: [proxy] }));
     assert.deepEqual(routed, {});
+  });
+
+  test("virtual selections opt into prompt rewriting when the chain cannot reach Codex", async () => {
+    const { hooks } = setup();
+    const systemPrompt = [
+      "You are a coding assistant.",
+      "<session-overview>",
+      "Branch: main",
+      "## RECENT COMMITS",
+      "abc123 changed something",
+      "</session-overview>",
+    ].join("\n");
+    const event = { systemPrompt, systemPromptOptions: { cwd: "/tmp", contextFiles: [], skills: [] } };
+    const proxy = physical("proxy", "kimi-k3");
+
+    process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = "1";
+    try {
+      const routed = await hooks.get("before_agent_start")!(
+        event,
+        context(virtualModel(), { branch: [assistantEntry("proxy", "kimi-k3", "openai-completions")], all: [proxy] }),
+      ) as { systemPrompt?: string };
+      assert.ok(
+        routed.systemPrompt && !routed.systemPrompt.includes("RECENT COMMITS"),
+        "virtual selection is optimized when explicitly opted in",
+      );
+    } finally {
+      delete process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE;
+    }
   });
 
   test("nested codemode tool calls do not refresh the footer on their own", async () => {

@@ -92,6 +92,7 @@ Pi 0.79.7 及之后，`pi update` 默认只更新 Pi 本体。若要更新已安
 | 环境变量 | 作用 |
 |---|---|
 | `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | 只关闭 prompt 改写；footer 统计和 cache-key fallback 仍启用。 |
+| `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` | 允许 Pi 0.99+ 虚拟模型走 prompt 改写（默认关闭）。仅当路由链中任何候选都到不了带安全过滤的 Codex 后端时才开启。 |
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | 保留 Pi 原始 verbose skill XML。 |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | 关闭 OpenAI-compatible `prompt_cache_key` fallback。推荐使用这个显式 opt-out。 |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | 通过旧的反向开关关闭同一个 fallback。取值 `0`、`false`、`no`、`off` 时关闭。 |
@@ -366,7 +367,7 @@ Pi 0.99 允许扩展通过 `pi.registerVirtualModel()` 注册虚拟模型。选�
 - 请求 hook 从 provider payload 中读取实际派发的模型 id，并在已配置凭证的物理模型中匹配。`prompt_cache_key` fallback、`prompt_cache_retention` 安全规则、Anthropic TTL 修复以及按模型关闭 `prompt_cache_key` 的规则都按该物理模型生效。如果多个已配置凭证的 provider 共用同一个 id 且处理方式不同，扩展不会猜测，而是跳过依赖模型身份的请求修改。
 - Footer 统计以及 `/cache-optimizer doctor`、`compat`、`stats`、`reset`、`fix` 使用当前会话分支上最近一次应答的物理模型，与 Pi 自身显示的路由模型和 context 上限一致。doctor 与 compat 会同时标出虚拟选择和该物理模型。
 - 在 Pi 路由第一个请求之前，footer 保持为空，诊断会提示先发送一个 prompt。
-- 虚拟选择不做 prompt 改写：Pi 在构建 system prompt 之后才决定物理模型，重排后的 prompt 不应被送到有安全过滤的 Codex 路由。
+- 虚拟选择默认不做 prompt 改写：Pi 在构建 system prompt 之后才决定物理模型，重排后的 prompt 不应被送到有安全过滤的 Codex 路由。当路由链中任何候选都确认安全时，可设 `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` 显式开启。
 - Session-affinity header 桥接同样跳过，因为 Pi 在 payload 生成之前就构造请求 header。Pi 仍会发送物理模型自身配置的 affinity header。
 
 ## Router / Virtual-channel 扩展作者指南

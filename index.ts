@@ -131,6 +131,7 @@ const NO_OPENAI_CACHE_KEY_ENV = "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY";
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
 const NO_SKILL_COMPRESSION_ENV = "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION";
 const NO_PROMPT_REWRITE_ENV = "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE";
+const VIRTUAL_REWRITE_ENV = "PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE";
 const TOOL_ORDER_ENV = "PI_CACHE_OPTIMIZER_TOOL_ORDER";
 const FOOTER_MODE_ENV = "PI_CACHE_OPTIMIZER_FOOTER_MODE";
 type FooterStatsMode = "session" | "total" | "process";
@@ -10141,6 +10142,7 @@ export const __internals_for_tests = {
   MIN_STABLE_CANDIDATE_LENGTH,
   SKILL_COMPRESSION_MIN_COUNT,
   NO_PROMPT_REWRITE_ENV,
+  VIRTUAL_REWRITE_ENV,
   isEnabledEnv,
   // OpenAI-family cache-key helpers
   addOpenAIPromptCacheKey,
@@ -11202,7 +11204,7 @@ export default function (pi: ExtensionAPI) {
     // after this system prompt is built, so the bypass above cannot be decided
     // here. A route may reach the safety-filtered Codex backend; keep Pi's
     // prompt byte-for-byte instead of reordering it.
-    if (isNativeVirtualModel(_ctx.model)) {
+    if (isNativeVirtualModel(_ctx.model) && !isEnabledEnv(process.env[VIRTUAL_REWRITE_ENV])) {
       return {};
     }
 
