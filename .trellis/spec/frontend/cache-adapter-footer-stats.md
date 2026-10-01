@@ -210,7 +210,7 @@ core's own cache transport.
   persistently listed in the extension-owned config as
   `promptCacheKey.omit`; this removes both request-key spellings, including a
   key already supplied by Pi. Do not add `supportsPromptCacheKey` to Pi's
-  `models.json`, because Pi 0.87.1 does not define that compat field.
+  `models.json`, because Pi 0.99.2 does not define that compat field.
 * All `before_agent_start` prompt mutations (session-overview churn strip,
   skill compression, stable-prefix reorder) can be disabled persistently with:
   `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` (truthy: `1`, `true`, `yes`, `on`).
@@ -722,6 +722,108 @@ verification harness in any task that touches this code path SHOULD
 include a test that mirrors the regression (build candidates that include
 single-character entries, assert the dynamic remainder is byte-equivalent
 to a control run with the noise pre-filtered).
+
+---
+
+## Native virtual models (Pi 0.99+)
+
+Pi 0.99 extensions register virtual models with `pi.registerVirtualModel()`.
+This is separate from the optional routing protocol below and needs no router
+integration.
+
+### 1. Scope / Trigger
+
+* Trigger: `ctx.model.api === "pi-virtual"` (Pi's `VIRTUAL_MODEL_API`). Pi keeps
+  `ctx.model`, `model_select`, and `/model` on the virtual selection, and
+  dispatches every request to a physical model. Providers receive only that
+  physical model; each assistant message names it (`provider`, `model`, `api`).
+* `before_provider_request`, `before_provider_headers`, and
+  `after_provider_response` receive no model; their `ctx.model` stays virtual.
+* Older Pi hosts never produce this API, so every path below is inert there.
+
+### 2. Signatures
+
+```ts
+const PI_VIRTUAL_MODEL_API = "pi-virtual";
+isNativeVirtualModel(model): boolean;
+findNativeVirtualDispatches(ctx): { latestSuccessful?; latestAny? };
+resolveNativeVirtualRouteModel(model, ctx): PiModel | undefined;
+resolveNativeVirtualRequestModel(model, payload, ctx, requestPolicyKey?):
+  { model: PiModel; identityAmbiguous: boolean } | undefined;
+```
+
+### 3. Contracts
+
+* Pre-request UX (footer, doctor, compat, stats, reset, fix, model_select
+  compat notices) uses the physical model of the latest successful assistant
+  message on `ctx.sessionManager.getBranch()`, matching Pi's routed-model
+  display and context limits. `resolveRouteModel()` returns it for a native
+  virtual selection. Use the catalog id `message.model`, not the echoed
+  `responseModel`, and look it up in the registry, rejecting registry hits that
+  are themselves virtual.
+* Request hooks resolve the physical model from the payload's dispatched model
+  id (`model`; Bedrock `modelId`): first among credentialed physical models
+  (`getAvailable()`), then the sticky branch candidates (latest successful,
+  latest of any outcome), then a unique `getAll()` match. An id shared by
+  several providers resolves only when `requestPolicyKey` agrees for all of
+  them (API, official OpenAI endpoint, explicit long-retention opt-in, retention
+  400 history, Anthropic TTL fallback, prompt-cache-key omit), and the lifecycle
+  record is then marked identity-ambiguous.
+* Unresolved requests keep the virtual model, so identity-dependent mutations
+  fail closed: no key injection, no tool ordering, no TTL repair, and
+  `prompt_cache_retention` is stripped by the ordinary safe default.
+* `before_provider_headers` adds nothing for a native virtual selection.
+* `before_agent_start` performs no prompt mutation for a native virtual
+  selection, because a route may reach the safety-filtered Codex backend.
+* `message_end` resolves the message's dispatched catalog model through the
+  registry for adapter tokens, the stats key, and the footer compat marker.
+* `selectAdapterForModel()` never matches a native virtual model: an unrouted
+  selection shows no footer and keeps no stats under its virtual id.
+* Doctor and compat prefix a `🔀 Native virtual model <virtual> → latest routed
+  physical model <physical>` line; without a routed response the not-applicable
+  text asks the user to send a prompt first.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behavior |
+|---|---|
+| No routed response on the branch | No footer; compat/doctor explain routing per request. |
+| Host `sessionManager` lacks `getBranch()` | Treat as no routed response. |
+| Payload has no `model`/`modelId` | Request unresolved; fail closed. |
+| Payload id matches one credentialed provider | Apply that physical model's request policy. |
+| Shared id, identical request policy | Apply the shared policy; no model-scoped header evidence. |
+| Shared id, differing request policies | Unresolved; fail closed. |
+| Registry or branch access throws | Unresolved; never fail the hook. |
+
+### 5. Good / Base / Bad Cases
+
+* Good: `jev/auto` routes to `proxy/kimi-k3`; the omit rule for `proxy/kimi-k3`
+  removes `prompt_cache_key`, the footer shows `Kimi cache`, and doctor
+  diagnoses `proxy/kimi-k3`.
+* Base: a virtual model whose id contains an adapter token (`deepseek-auto`)
+  shows no footer until Pi routes a request.
+* Bad: deciding prompt-cache-key, retention, or TTL behavior from
+  `ctx.model.api === "pi-virtual"` or from a guessed provider of a shared id.
+
+### 6. Tests Required
+
+`tests/native-virtual-models.test.ts` pins `PI_VIRTUAL_MODEL_API` to the
+installed Pi `VIRTUAL_MODEL_API` and a real `ModelRuntime.registerVirtualModel()`
+entry, and covers branch and payload resolution, request policy per physical
+model, fail-closed ambiguity, the header bridge, footer/stats and reload
+restore, doctor/compat, prompt bypass, nested tool-call refresh, and the
+lifecycle cap.
+
+### 7. Wrong vs Correct
+
+```ts
+// Wrong: the virtual selection carries no transport or compat metadata.
+const requestModel = ctx.model;
+
+// Correct: resolve the dispatched physical model, failing closed when unsure.
+const requestModel = resolveNativeVirtualRequestModel(ctx.model, event.payload, ctx, requestPolicyKey)?.model
+  ?? resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+```
 
 ---
 

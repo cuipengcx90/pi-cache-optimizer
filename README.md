@@ -25,6 +25,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - [Auto-repair with `/cache-optimizer fix`](#auto-repair-with-cache-optimizer-fix)
 - [DeepSeek protocol safety and rollback](#deepseek-protocol-safety-and-rollback)
 - [Footer stats](#footer-stats)
+- [Native virtual models (Pi 0.99+)](#native-virtual-models-pi-099)
 - [For router / virtual-channel extension authors](#for-router--virtual-channel-extension-authors)
 - [Uninstall](#uninstall)
 - [Verify effect](#verify-effect)
@@ -42,6 +43,7 @@ Pi extension for improving provider-side KV / prompt cache hit rates. It keeps s
 - Shows current conversation-session provider/model footer stats by default; `total` aggregates all valid local shards for the exact provider/model.
 - Supports optional router-extension integration through versioned global protocols (`Symbol.for("pi.routing.registry.v1")` and `Symbol.for("pi.cache.hints.v1")`) without importing router packages.
 - Includes disabled-by-default deterministic ordering for verified built-in tool payloads.
+- Supports Pi 0.99+ native virtual models (`pi.registerVirtualModel()`): request hooks, footer stats, and diagnostics act on the physical model each request is routed to.
 
 Caching is provider-side and best-effort. Third-party proxies and router extensions can still hide cache usage, reject unsupported parameters, or route requests across multiple upstreams.
 
@@ -61,7 +63,7 @@ Run `/reload` in Pi after install/update/remove so extension hooks refresh.
 
 On Pi 0.79.7 and newer, `pi update` updates Pi itself only. To update installed Pi packages such as this extension, run `pi update --extensions` (packages only) or `pi update --all` (Pi + packages).
 
-This extension requires Pi 0.82+ and is validated against Pi 0.87.1. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases.
+This extension requires Pi 0.82+ and is validated against Pi 0.99.2. It uses the official Pi package types directly for type-checking, along with extension hooks, `getAgentDir()`, and prompt options shared by those versions; it does not depend on Pi 0.83+ APIs such as `ctx.scopedModels` or the bundled TypeBox 1.3 aliases. Native virtual model support and codemode nested-call coalescing activate only on Pi 0.99+ hosts that produce them; older hosts keep the previous behavior.
 
 ## Commands
 
@@ -134,7 +136,7 @@ The explicit setting is stored in `pi-cache-optimizer-config.json` under Pi's ag
 
 ## Per-model `prompt_cache_key` opt-out
 
-Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.87.1 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
+Some OpenAI-compatible endpoints reject `prompt_cache_key` with HTTP 400 even though the same field is valid for other providers. Pi 0.99.2 has no native `supportsPromptCacheKey` compat field; do **not** add that unknown field to `models.json`. `supportsLongCacheRetention` is not an equivalent switch and should not be used for this purpose.
 
 When the extension observes an explicit field-level `prompt_cache_key` unsupported error for the exact provider/model, ordinary `/cache-optimizer fix` offers a confirmed model-scoped repair. Value-validation failures and conditional restrictions such as “not allowed when temperature is set” do not qualify. If concurrent responses from different models cannot be correlated because Pi provides no request ID, header-only evidence is ignored unless the finalized assistant message supplies exact provider/model identity. If you already know that the endpoint rejects the field, use the explicit command:
 
@@ -148,7 +150,7 @@ The preview explains that the setting is stored in the extension-owned `pi-cache
 
 Third-party `openai-completions` proxies (LiteLLM / OneAPI / NewAPI / OpenRouter-like channels) often route one session across multiple upstream backends. That splits provider-side prompt caches.
 
-Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. Pi 0.87.1 has no native `supportsPromptCacheKey` compat field, so the per-model key opt-out is stored in this extension's `pi-cache-optimizer-config.json` instead of `models.json`. The extension config is independent of Pi's compat precedence and only affects the exact provider/model listed there.
+Pi 0.84.1 also fixes built-in Fireworks compatibility for models that reject `prompt_cache_retention`; the extension avoids provider-name special cases and resolves exact provider/model compat from `models.json` plus the runtime model. Pi 0.81+ also has a built-in `llama.cpp` provider using an OpenAI-shaped transport. Pi 0.82+ core generates a session `prompt_cache_key` for it when cache retention is enabled, so this extension preserves that key and may add the same conservative fallback when missing. The built-in provider's explicit compat fingerprint is excluded from generic proxy routing/session-affinity advice, but a custom or overridden provider that merely reuses the id `llama.cpp` is treated like any other OpenAI-compatible channel. `prompt_cache_retention` remains subject to the normal safety rule: keep it only for official OpenAI or an explicit effective `supportsLongCacheRetention: true` opt-in in `models.json`; otherwise strip it before sending. Pi 0.99.2 has no native `supportsPromptCacheKey` compat field, so the per-model key opt-out is stored in this extension's `pi-cache-optimizer-config.json` instead of `models.json`. The extension config is independent of Pi's compat precedence and only affects the exact provider/model listed there.
 
 For real proxies, start with session affinity:
 
@@ -174,7 +176,7 @@ Notes:
 
 - `sendSessionAffinityHeaders: true` is the safe default when your proxy supports sticky routing.
 - `supportsLongCacheRetention: true` is optional. Add it only when the endpoint explicitly supports OpenAI long prompt cache retention.
-- Do not add `supportsPromptCacheKey` to `models.json`: Pi 0.87.1 does not define that compat field. Use `/cache-optimizer fix prompt-cache-key` to store an exact provider/model omit rule in the extension-owned config; it removes both key spellings, including a key supplied by Pi.
+- Do not add `supportsPromptCacheKey` to `models.json`: Pi 0.99.2 does not define that compat field. Use `/cache-optimizer fix prompt-cache-key` to store an exact provider/model omit rule in the extension-owned config; it removes both key spellings, including a key supplied by Pi.
 - If you see `400 Unsupported parameter: prompt_cache_retention`, remove/avoid `supportsLongCacheRetention` for that channel. Keep `sendSessionAffinityHeaders` if supported. The extension detects the explicit error from response headers or the finalized assistant error message and strips the parameter from subsequent requests in the current process.
 - Use `/cache-optimizer compat` or `/cache-optimizer doctor` to see model-specific advice.
 - DeepSeek model names select the `DS cache` adapter only; they do not prove a reasoning wire protocol. Generic cache/routing advice remains active for absent or non-DeepSeek formats. DeepSeek replay advice is shown only when effective `compat.thinkingFormat: "deepseek"` is explicitly configured; it never treats `thinkingFormat` as a missing fix key.
@@ -357,6 +359,16 @@ The leading `· ` is owned by this extension and separates its status from statu
 Supported footer labels include: DS, Claude, OpenAI, Gemini, Kimi, Qwen, GLM, MiniMax, Mimo, Hunyuan, Mistral, Grok, Llama, Nemotron, Cohere, Yi, Doubao, ERNIE, Baichuan, StepFun, Spark, InternLM, Gemma, Phi, Jamba, Solar, Sonar, Nova, Reka, Falcon, DBRX, MPT, StableLM, Aquila, EXAONE, HyperCLOVA, Luminous, Hermes, Granite, Arctic, Pangu, SenseNova, Zhinao, MiniCPM, XVERSE, Orion, OpenChat, Vicuna, Wizard, Zephyr, Dolphin, OpenOrca, Starling, BLOOM, RWKV, and Aya.
 
 Adapter selection uses only model id/name (plus assistant message model/name on message end). Generic OpenAI-shaped APIs are not treated as OpenAI-family unless the model id/name matches a supported family.
+
+## Native virtual models (Pi 0.99+)
+
+Pi 0.99 lets extensions register virtual models with `pi.registerVirtualModel()`. While one is selected, `ctx.model` stays the virtual model (`api: "pi-virtual"`) and Pi routes every request to a physical model. This extension follows the physical model automatically; router authors do not need the protocol below.
+
+- Request hooks read the dispatched model id from the provider payload and match it against physical models with configured credentials. The `prompt_cache_key` fallback, `prompt_cache_retention` safety, Anthropic TTL repair, and per-model `prompt_cache_key` omit rules then apply to that physical model. If several credentialed providers share the id and would be treated differently, the extension does not guess; identity-dependent request changes are skipped.
+- Footer stats and `/cache-optimizer doctor`, `compat`, `stats`, `reset`, and `fix` use the physical model that answered last on the current session branch, matching Pi's own routed-model display and context limits. Doctor and compat name both the virtual selection and that physical model.
+- Before Pi routes the first request, the footer stays empty and diagnostics ask you to send a prompt first.
+- Prompt rewriting is skipped for virtual selections: Pi picks the physical model after the system prompt is built, and a reordered prompt must not reach a safety-filtered Codex route.
+- The session-affinity header bridge is skipped as well, because Pi builds request headers before the payload exists. Pi still sends the physical model's own configured affinity headers.
 
 ## For router / virtual-channel extension authors
 

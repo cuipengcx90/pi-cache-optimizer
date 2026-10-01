@@ -212,6 +212,8 @@ type PromptCacheKeyConfigReceiptSnapshot = {
 };
 const PI_ROUTING_REGISTRY_SYMBOL = Symbol.for("pi.routing.registry.v1");
 const PI_CACHE_HINTS_SYMBOL = Symbol.for("pi.cache.hints.v1");
+// Model API that Pi 0.99+ assigns to native virtual models (VIRTUAL_MODEL_API).
+const PI_VIRTUAL_MODEL_API = "pi-virtual";
 const PI_CACHE_HINTS_OWNER_SYMBOL = Symbol.for("pi.cache.optimizer.hints-owner.v1");
 const ANTHROPIC_TTL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.anthropic-ttl-fallback.v1");
 const REASONING_PROTOCOL_FALLBACK_SYMBOL = Symbol.for("pi.cache.optimizer.reasoning-protocol-fallback.v1");
@@ -1397,6 +1399,9 @@ function resolveRouteModel(
   model: PiModel | undefined,
   ctx?: ContextWithOptionalModelRegistry,
 ): PiModel | undefined {
+  const nativeVirtualRoute = resolveNativeVirtualRouteModel(model, ctx);
+  if (nativeVirtualRoute) return nativeVirtualRoute;
+
   const snapshot = resolveActiveRouteSnapshot(model, ctx);
   if (!snapshot) return undefined;
 
@@ -1407,7 +1412,171 @@ function resolveRouteModel(
 
 function isVirtualRoutingModel(model: PiModel | undefined, ctx?: Pick<ExtensionContext, "sessionManager">): boolean {
   if (!model) return false;
-  return isRouterModel(model) || !!getRoutingRegistry()?.getRouter(model.provider) || !!resolveActiveRouteSnapshot(model, ctx);
+  return isNativeVirtualModel(model) || isRouterModel(model) || !!getRoutingRegistry()?.getRouter(model.provider) || !!resolveActiveRouteSnapshot(model, ctx);
+}
+
+// Pi 0.99+ native virtual models (`pi.registerVirtualModel()`). `ctx.model`
+// stays the virtual selection while Pi dispatches every request to a physical
+// model; only assistant messages and the provider payload name that model.
+// Older Pi hosts never produce this API, so every native-virtual path is inert.
+type NativeVirtualDispatch = { provider: string; id: string; api: string };
+
+function isNativeVirtualModel(model: { api?: unknown } | undefined): boolean {
+  return model?.api === PI_VIRTUAL_MODEL_API;
+}
+
+function readSessionBranch(ctx: Pick<ExtensionContext, "sessionManager"> | undefined): unknown[] {
+  try {
+    const manager = ctx?.sessionManager as { getBranch?: () => unknown } | undefined;
+    if (typeof manager?.getBranch !== "function") return [];
+    const branch = manager.getBranch();
+    return Array.isArray(branch) ? branch : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Physical models that answered on the current session branch, newest first:
+ * the latest successful response (Pi's `request.previous`) and the latest
+ * response of any outcome (a failed attempt that a retry may reuse). The
+ * catalog id in `message.model` is preferred over the echoed `responseModel`
+ * because it is the id Pi dispatched and the registry knows.
+ */
+function findNativeVirtualDispatches(ctx: Pick<ExtensionContext, "sessionManager"> | undefined): {
+  latestSuccessful?: NativeVirtualDispatch;
+  latestAny?: NativeVirtualDispatch;
+} {
+  const branch = readSessionBranch(ctx);
+  let latestSuccessful: NativeVirtualDispatch | undefined;
+  let latestAny: NativeVirtualDispatch | undefined;
+  for (let index = branch.length - 1; index >= 0 && !latestSuccessful; index--) {
+    const entry = asRecord(branch[index]);
+    if (entry?.type !== "message") continue;
+    const message = getAssistantRecord(entry.message);
+    if (!message || isNativeVirtualModel(message)) continue;
+    const dispatch = nativeVirtualDispatchFromMessage(message);
+    if (!dispatch) continue;
+    latestAny ??= dispatch;
+    if (message.stopReason !== "error" && message.stopReason !== "aborted") latestSuccessful = dispatch;
+  }
+  return { latestSuccessful, latestAny };
+}
+
+function nativeVirtualDispatchFromMessage(message: unknown): NativeVirtualDispatch | undefined {
+  const record = getAssistantRecord(message);
+  if (!record || isNativeVirtualModel(record)) return undefined;
+  const provider = firstNonEmptyString(record.provider);
+  const id = firstNonEmptyString(record.model, record.responseModel);
+  return provider && id ? { provider, id, api: firstNonEmptyString(record.api) ?? "" } : undefined;
+}
+
+function nativeVirtualDispatchToModel(
+  dispatch: NativeVirtualDispatch,
+  ctx?: ContextWithOptionalModelRegistry,
+): PiModel {
+  // A virtual model hides a same-id physical model in the catalog, so a
+  // registry hit that is itself virtual is not physical metadata.
+  const registered = findModelInRegistry(ctx?.modelRegistry, dispatch.provider, dispatch.id);
+  const model = registered && !isNativeVirtualModel(registered)
+    ? registered
+    : ({
+      provider: dispatch.provider,
+      id: dispatch.id,
+      name: dispatch.id,
+      api: dispatch.api,
+      baseUrl: "",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 0,
+      maxTokens: 0,
+      [ROUTED_FALLBACK_MODEL_SYMBOL]: true,
+    } as PiModel);
+  return applyConfiguredTransportToModel(model, readEffectiveCompatConfig());
+}
+
+/**
+ * Physical model behind a native virtual selection for pre-request UX (footer,
+ * doctor, compat, stats, reset, fix): the model that answered last on this
+ * session branch, matching Pi's own routed-model display and context limits.
+ */
+function resolveNativeVirtualRouteModel(
+  model: PiModel | undefined,
+  ctx?: ContextWithOptionalModelRegistry,
+): PiModel | undefined {
+  if (!isNativeVirtualModel(model)) return undefined;
+  const { latestSuccessful, latestAny } = findNativeVirtualDispatches(ctx);
+  const dispatch = latestSuccessful ?? latestAny;
+  return dispatch ? nativeVirtualDispatchToModel(dispatch, ctx) : undefined;
+}
+
+function getProviderPayloadModelId(payload: unknown): string | undefined {
+  const record = asRecord(payload);
+  // Pi's built-in transports put the dispatched catalog id in `model`
+  // (OpenAI, Anthropic, Google, Mistral) or `modelId` (Bedrock Converse).
+  return firstNonEmptyString(record?.model, record?.modelId);
+}
+
+function physicalModelsWithId(candidates: readonly PiModel[] | undefined, id: string): PiModel[] {
+  return (candidates ?? []).filter((candidate) => candidate.id === id && !isNativeVirtualModel(candidate));
+}
+
+/**
+ * Physical model of one native-virtual request. `before_provider_request`
+ * carries only the payload and `ctx.model` stays virtual, so the payload's
+ * dispatched model id is matched against credentialed physical models (a
+ * router may only route to those). A unique provider match wins. An id shared
+ * by several credentialed providers is used only when every candidate gets the
+ * same request treatment (`requestPolicyKey`); the identity then stays
+ * ambiguous so response evidence is never pinned to a guessed provider.
+ * Differing policies return undefined so identity-dependent request mutations
+ * fail closed. Without a credentialed match, the sticky branch candidates and
+ * then the full catalog are consulted.
+ */
+function resolveNativeVirtualRequestModel(
+  model: PiModel | undefined,
+  payload: unknown,
+  ctx?: ContextWithOptionalModelRegistry,
+  requestPolicyKey?: (candidate: PiModel) => string,
+): { model: PiModel; identityAmbiguous: boolean } | undefined {
+  if (!isNativeVirtualModel(model)) return undefined;
+  const payloadModelId = getProviderPayloadModelId(payload);
+  if (!payloadModelId) return undefined;
+  const config = readEffectiveCompatConfig();
+  // null: no candidate; undefined: ambiguous with differing request policies.
+  const pick = (matches: PiModel[]): { model: PiModel; identityAmbiguous: boolean } | undefined | null => {
+    if (matches.length === 0) return null;
+    const configured = matches.map((candidate) => applyConfiguredTransportToModel(candidate, config));
+    if (new Set(configured.map((candidate) => candidate.provider)).size === 1) {
+      return { model: configured[0], identityAmbiguous: false };
+    }
+    const policies = requestPolicyKey ? new Set(configured.map(requestPolicyKey)) : undefined;
+    return policies?.size === 1 ? { model: configured[0], identityAmbiguous: true } : undefined;
+  };
+  try {
+    const credentialed = pick(physicalModelsWithId(ctx?.modelRegistry?.getAvailable?.(), payloadModelId));
+    if (credentialed !== null) return credentialed;
+
+    const { latestSuccessful, latestAny } = findNativeVirtualDispatches(ctx);
+    for (const dispatch of [latestSuccessful, latestAny]) {
+      if (dispatch?.id === payloadModelId) {
+        return { model: nativeVirtualDispatchToModel(dispatch, ctx), identityAmbiguous: false };
+      }
+    }
+
+    return pick(physicalModelsWithId(ctx?.modelRegistry?.getAll?.(), payloadModelId)) ?? undefined;
+  } catch {
+    // Registry access is optional input; never fail the provider request hook.
+    return undefined;
+  }
+}
+
+function describeNativeVirtualRouteNote(selected: PiModel | undefined, effective: PiModel | undefined): string | undefined {
+  if (!selected || !isNativeVirtualModel(selected)) return undefined;
+  // Without a routed response, the not-applicable text explains the state.
+  if (!effective || isNativeVirtualModel(effective)) return undefined;
+  return `🔀 Native virtual model ${modelKey(selected)} → latest routed physical model ${modelKey(effective)}. The diagnostics below apply to that physical model; Pi may route later requests elsewhere.`;
 }
 
 function isCacheHintsServiceV1(value: unknown): value is PiCacheHintsV1 {
@@ -2604,7 +2773,7 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
 }
 
 function shouldInjectOpenAIPromptCacheKeyForModel(model: PiModel | undefined): boolean {
-  // Pi 0.87.1 has no native supportsPromptCacheKey compat field. Per-model
+  // Pi 0.99.2 has no native supportsPromptCacheKey compat field. Per-model
   // opt-out is owned by this extension's promptCacheKey.omit configuration;
   // this helper only exposes the transport API gate for fixture consumers.
   return isOpenAICompatibleApi(model?.api);
@@ -3445,6 +3614,22 @@ function snapshotProviderRequestModel(model: PiModel | undefined): PiModel | und
     contextWindow: model.contextWindow ?? 0,
     maxTokens: model.maxTokens ?? 0,
   } as PiModel;
+}
+
+// Some provider requests never produce a finalized assistant message: Pi's
+// prompt-cache warming (0.86+) replays a request with maxTokens: 1 outside the
+// agent loop, so message_end never consumes its lifecycle record. Cap the
+// process-local list and drop the oldest completed record first.
+const MAX_PROVIDER_REQUEST_STATES = 32;
+
+function pruneProviderRequestStates<T extends { responseReceived: boolean }>(
+  states: T[],
+  max = MAX_PROVIDER_REQUEST_STATES,
+): void {
+  while (states.length > max) {
+    const completed = states.findIndex((state) => state.responseReceived);
+    states.splice(completed >= 0 ? completed : 0, 1);
+  }
 }
 
 function keyForModelExt(model: { provider: string; id: string }): string {
@@ -5273,6 +5458,9 @@ const CACHE_PROVIDER_ADAPTERS: CacheProviderAdapter[] = [
 ];
 
 function selectAdapterForModel(model: PiModel | undefined): CacheProviderAdapter | undefined {
+  // A native virtual selection has no cache identity of its own; stats always
+  // belong to the physical model it routed to.
+  if (isNativeVirtualModel(model)) return undefined;
   return CACHE_PROVIDER_ADAPTERS.find((adapter) => adapter.matchesModel(model));
 }
 
@@ -6643,6 +6831,13 @@ function describeRouterChannelDiagnostics(model: PiModel): string[] {
 
 function getCompatCheckNotApplicableLines(model: PiModel): string[] {
   const api = lower(model.api);
+
+  if (isNativeVirtualModel(model)) {
+    return [
+      "ℹ️ Compat check not applicable for this model.",
+      "   Native virtual model: Pi routes each request to a physical model and none has answered on this session branch yet. Send a prompt, then rerun to diagnose the physical model that answered.",
+    ];
+  }
 
   if (isMistralConversationsApi(api)) {
     return [
@@ -10214,6 +10409,16 @@ export const __internals_for_tests = {
   applyConfiguredTransportToModel,
   resolveRouteModel,
   isVirtualRoutingModel,
+  PI_VIRTUAL_MODEL_API,
+  isNativeVirtualModel,
+  findNativeVirtualDispatches,
+  resolveNativeVirtualRouteModel,
+  resolveNativeVirtualRequestModel,
+  getProviderPayloadModelId,
+  getCompatCheckNotApplicableLines,
+  describeNativeVirtualRouteNote,
+  pruneProviderRequestStates,
+  MAX_PROVIDER_REQUEST_STATES,
   installCacheHintsService,
   getCacheHintsService,
   markOptimizerOwnedCacheHintsService,
@@ -10349,6 +10554,8 @@ export default function (pi: ExtensionAPI) {
     model: PiModel;
     responseReceived: boolean;
     correlationAmbiguous: boolean;
+    // A native virtual request whose dispatched id matched several providers.
+    identityAmbiguous?: boolean;
   };
   const providerRequestStates: ProviderRequestState[] = [];
   let shardCreatedAt = Date.now();
@@ -10880,6 +11087,24 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  /**
+   * Request treatment that before_provider_request derives from a model's
+   * identity. A native virtual request whose dispatched id matches several
+   * credentialed providers is resolved only when this key agrees for all of
+   * them, so no provider-specific decision is applied on a guess.
+   */
+  function requestPolicyKey(model: PiModel): string {
+    const key = modelKey(model);
+    return JSON.stringify([
+      model.api ?? "",
+      isOfficialOpenAIBaseUrl(model),
+      hasExplicitLongRetentionOptIn(model),
+      promptCacheRetention400Models.has(key),
+      anthropicTtlOrderErrorModels.has(key),
+      isPromptCacheKeyOmittedForModel(model),
+    ]);
+  }
+
   pi.on("session_start", async (event, ctx) => {
     if (runtimeOptimizerEnabled) requestLongCacheRetention();
     await restoreCacheStats(event.reason, ctx);
@@ -10894,7 +11119,10 @@ export default function (pi: ExtensionAPI) {
     await publishStatus(ctx);
   });
 
-  pi.on("tool_execution_end", async (_event, ctx) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
+    // Pi 0.99+ codemode scripts run nested tool calls in parallel; the calling
+    // tool's own end event follows them, so one refresh covers the batch.
+    if (isNonEmptyString((event as { parentToolCallId?: unknown } | undefined)?.parentToolCallId)) return;
     await refreshShardAggregate();
     await publishStatus(ctx);
   });
@@ -10965,6 +11193,13 @@ export default function (pi: ExtensionAPI) {
     // ────────────────────────────────────────────────────────────────
     const model = routedModel ?? _ctx.model;
     if (model && isResponsesPromptRewriteBypassApi(model.api)) {
+      return {};
+    }
+    // Pi 0.99+ native virtual selections pick the physical model per request,
+    // after this system prompt is built, so the bypass above cannot be decided
+    // here. A route may reach the safety-filtered Codex backend; keep Pi's
+    // prompt byte-for-byte instead of reordering it.
+    if (isNativeVirtualModel(_ctx.model)) {
       return {};
     }
 
@@ -11045,6 +11280,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_headers", (event, ctx) => {
+    // Pi transforms headers before the payload exists and passes no model, so a
+    // native virtual request's physical model is unknown here. Fail closed; Pi
+    // core still sends the physical model's own configured affinity headers.
+    if (isNativeVirtualModel(ctx.model)) return;
     const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
     addEffectiveSessionAffinityHeaders(
       event.headers,
@@ -11054,12 +11293,24 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (event, ctx) => {
-    const requestModel = resolveRouteModel(ctx.model, ctx) ?? ctx.model;
+    // A native virtual selection keeps ctx.model virtual; resolve the physical
+    // model from the dispatched payload. Unresolved requests keep the virtual
+    // model, which fails every identity-dependent mutation closed.
+    const nativeVirtualRequest = resolveNativeVirtualRequestModel(ctx.model, event.payload, ctx, requestPolicyKey);
+    const requestModel = nativeVirtualRequest?.model ?? resolveRouteModel(ctx.model, ctx) ?? ctx.model;
     // Request-local identity is also needed by the always-on Anthropic TTL
     // validity repair, so retain the credential-blind snapshot even while the
     // optional runtime optimizer features are disabled.
     const snapshot = snapshotProviderRequestModel(requestModel);
-    if (snapshot) providerRequestStates.push({ model: snapshot, responseReceived: false, correlationAmbiguous: false });
+    if (snapshot) {
+      providerRequestStates.push({
+        model: snapshot,
+        responseReceived: false,
+        correlationAmbiguous: false,
+        identityAmbiguous: isNativeVirtualModel(ctx.model) && (!nativeVirtualRequest || nativeVirtualRequest.identityAmbiguous),
+      });
+      pruneProviderRequestStates(providerRequestStates);
+    }
     let requestPayload: unknown = event.payload;
     let toolOrderChanged = false;
 
@@ -11145,7 +11396,12 @@ export default function (pi: ExtensionAPI) {
       }
     }
     if (responseState) responseState.responseReceived = true;
-    const model = responseState?.model ?? (pendingStates.length === 0 ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
+    // A native virtual request whose physical provider could not be pinned
+    // records no model-scoped header evidence; finalized assistant messages
+    // still carry exact provider/model identity.
+    const model = responseState
+      ? (responseState.identityAmbiguous ? undefined : responseState.model)
+      : (pendingStates.length === 0 && !isNativeVirtualModel(ctx.model) ? (resolveRouteModel(ctx.model, ctx) ?? ctx.model) : undefined);
     if (!runtimeOptimizerEnabled || !model) return;
 
     // Keep only the category, never the provider's complete error text. This
@@ -11254,9 +11510,10 @@ export default function (pi: ExtensionAPI) {
           : (completedIndex >= 0 ? completedIndex : (contextIndex >= 0 ? contextIndex : 0));
         const state = providerRequestStates.splice(index, 1)[0];
         if (!state) return { model: undefined, ambiguous: false };
+        const ambiguous = (state.correlationAmbiguous || state.identityAmbiguous === true) && explicitIndex < 0;
         return {
-          model: state.correlationAmbiguous && explicitIndex < 0 ? undefined : state.model,
-          ambiguous: state.correlationAmbiguous && explicitIndex < 0,
+          model: ambiguous ? undefined : state.model,
+          ambiguous,
         };
       })()
       : { model: undefined, ambiguous: false };
@@ -11344,7 +11601,18 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const adapter = selectAdapterForAssistantMessage(event.message, ctx.model);
+    // A native virtual selection keeps ctx.model virtual, while the finalized
+    // message names the physical catalog model Pi dispatched. Resolve that
+    // model from the registry so adapter tokens, the stats key, and the footer
+    // compat marker use the same physical identity as the pre-request UX.
+    const nativeVirtualDispatch = isNativeVirtualModel(ctx.model)
+      ? nativeVirtualDispatchFromMessage(event.message)
+      : undefined;
+    const nativeVirtualMessageModel = nativeVirtualDispatch
+      ? nativeVirtualDispatchToModel(nativeVirtualDispatch, ctx)
+      : undefined;
+
+    const adapter = selectAdapterForAssistantMessage(event.message, nativeVirtualMessageModel ?? ctx.model);
     if (!adapter) return;
 
     // Skip stats for error/aborted messages (network retries, user aborts).
@@ -11374,6 +11642,7 @@ export default function (pi: ExtensionAPI) {
     // the active model id. Virtual routing providers keep message-local
     // identity (router correctness).
     statsModel = consolidateDirectProviderStatsModel(statsModel, ctx.model, ctx);
+    if (nativeVirtualMessageModel) statsModel = nativeVirtualMessageModel;
     let routedModelChanged = false;
     if (isVirtualRoutingModel(ctx.model, ctx) && statsModel && !isVirtualRoutingModel(statsModel, ctx)) {
       const nextRoutedModel: PersistedRoutedModelRef = {
@@ -11488,9 +11757,8 @@ export default function (pi: ExtensionAPI) {
         const statsState = model ? cacheStatsTotalsByModel[modelKey(model)] : undefined;
         const samples = sk ? getRecentSamples(sk) : [];
         const lowHitLines = buildLowHitDiagnosis(model, adapter, statsState, samples);
-        const fullDiagnosis = lowHitLines.length > 0
-          ? diagnosis + "\n" + lowHitLines.join("\n")
-          : diagnosis;
+        const routeNote = describeNativeVirtualRouteNote(selectedModel, model);
+        const fullDiagnosis = [routeNote, diagnosis, ...lowHitLines].filter((line) => line !== undefined).join("\n");
         cmdCtx.ui.notify(fullDiagnosis, "info");
       } else if (subcommand === "stats") {
         const aggregate = await refreshShardAggregate();
@@ -11541,13 +11809,15 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const compatResult = buildCompatDiagnosis(model);
+        const compatRouteNote = describeNativeVirtualRouteNote(selectedModel, model);
+        const withRouteNote = (text: string): string => compatRouteNote ? `${compatRouteNote}\n${text}` : text;
         if (compatResult) {
-          cmdCtx.ui.notify(compatResult, "warning");
+          cmdCtx.ui.notify(withRouteNote(compatResult), "warning");
         } else {
           cmdCtx.ui.notify(
-            isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)
+            withRouteNote(isAdaptiveThinkingCompatApplicable(model) || isDeepSeekCompatCheckApplicable(model) || isCompatCheckApplicable(model)
               ? "✅ Compat fully configured."
-              : getCompatCheckNotApplicableLines(model).join("\n"),
+              : getCompatCheckNotApplicableLines(model).join("\n")),
             "info",
           );
         }

@@ -265,6 +265,21 @@ describe("OpenAI-compatible request contracts", () => {
     }
   });
 
+  test("skill compression anchors on the installed Pi skills formatter", async () => {
+    // compressSkillsInSystemPrompt only substitutes an exact copy of Pi's
+    // verbose skills block. Drift would silently disable compression.
+    const piSkills = await createJiti(join(process.cwd(), "tests", "skills-format-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js")>(
+      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "skills.js"),
+    );
+    const sourceInfo = { path: "/skills/alpha/SKILL.md", source: "local", scope: "user", origin: "top-level" };
+    const skills = [
+      { name: "alpha", description: "Alpha <xml> & \"quotes\"", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", sourceInfo, disableModelInvocation: false },
+      { name: "beta", description: "Beta", filePath: "/project/.pi/skills/beta/SKILL.md", baseDir: "/project/.pi/skills/beta", sourceInfo, disableModelInvocation: false },
+      { name: "hidden", description: "Hidden", filePath: "/skills/hidden/SKILL.md", baseDir: "/skills/hidden", sourceInfo, disableModelInvocation: true },
+    ] as any;
+    assert.equal(internals.formatSkillsForPrompt(skills), piSkills.formatSkillsForPrompt(skills));
+  });
+
   test("installed Pi registerProvider drops lower provider compat for extension-owned models", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-extension-provider-model-test-"));
     try {
