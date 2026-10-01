@@ -115,9 +115,17 @@ being massaged. Do NOT special-case-bump these counters.
 
 * The built-in model shape uses provider `llama.cpp`, API `openai-completions`,
   and a characteristic explicit compat fingerprint (`supportsStore`,
-  `supportsDeveloperRole`, `supportsReasoningEffort`, `supportsUsageInStreaming`,
-  and `supportsStrictMode` all `false`; `maxTokensField: "max_tokens"`). The
-  configured router URL may be local or remote.
+  `supportsDeveloperRole`, `supportsReasoningEffort`, and `supportsStrictMode`
+  all `false`; `maxTokensField: "max_tokens"`; no session-affinity or
+  long-retention fields). The configured router URL may be local or remote.
+* `supportsUsageInStreaming` MUST NOT be part of the fingerprint: Pi 0.82.x
+  sets it `false`, while Pi 0.83+ sets it `true` after fixing streamed usage.
+  Requiring `false` silently disabled the exemption on every Pi 0.83+ host.
+  The contract test in `tests/runtime-contracts.test.ts` builds the model from
+  the installed Pi `createLlamaProvider()`, so upstream shape drift fails CI
+  instead of reviving generic proxy advice for untouched built-in models.
+  Pi 0.99+ also lists a `llama-cpp-classify` classifier per model; its API is
+  not `openai-completions`, so it never matches the fingerprint.
 * Pi 0.82+ core treats this transport like other OpenAI completions channels and
   may generate a session `prompt_cache_key`. The extension MUST preserve an
   existing key and MAY add its same session-id fallback when the key is absent.

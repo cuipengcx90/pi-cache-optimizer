@@ -2589,11 +2589,13 @@ function isPiBuiltInLlamaCppModel(model: PiModel | undefined): boolean {
   // Pi's built-in llama.cpp provider supplies this exact explicit compat
   // fingerprint. Provider ids are extension-overridable and models.json can add
   // cache/routing overrides, so provider id alone must never imply exemption.
+  // supportsUsageInStreaming is deliberately not part of the fingerprint: Pi
+  // 0.82.x sets it false and Pi 0.83+ sets it true after fixing streamed usage,
+  // and it carries no routing or cache configuration.
   const compat = getCompat(model);
   return compat.supportsStore === false
     && compat.supportsDeveloperRole === false
     && compat.supportsReasoningEffort === false
-    && compat.supportsUsageInStreaming === false
     && compat.supportsStrictMode === false
     && compat.maxTokensField === "max_tokens"
     && compat.sendSessionAffinityHeaders === undefined
