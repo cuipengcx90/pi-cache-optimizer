@@ -1,0 +1,416 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { after, before, describe, test } from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createJiti } from "jiti";
+
+// Pi 0.99+ native virtual models keep ctx.model virtual (api "pi-virtual")
+// while Pi dispatches each request to a physical model. These tests pin how
+// the extension resolves that physical model for request hooks, footer stats,
+// and diagnostics.
+
+const OPTIMIZER_ENV = [
+  "PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY",
+  "PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY",
+  "PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE",
+  "PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION",
+  "PI_CACHE_OPTIMIZER_TOOL_ORDER",
+  "PI_CACHE_OPTIMIZER_FOOTER_MODE",
+  "PI_CACHE_RETENTION",
+];
+
+let agentDir: string;
+let previousAgentDir: string | undefined;
+const previousOptimizerEnv = new Map<string, string | undefined>();
+let extension: typeof import("../index.ts");
+let jiti: ReturnType<typeof createJiti>;
+let t: (typeof import("../index.ts"))["__internals_for_tests"];
+
+before(async () => {
+  agentDir = await mkdtemp(join(tmpdir(), "pi-cache-native-virtual-"));
+  previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  for (const name of OPTIMIZER_ENV) {
+    previousOptimizerEnv.set(name, process.env[name]);
+    delete process.env[name];
+  }
+  // The extension config is read at module load; create the omit rule first.
+  await writeFile(
+    join(agentDir, "pi-cache-optimizer-config.json"),
+    JSON.stringify({ version: 2, promptCacheKey: { omit: ["strict-proxy/omit-model"] } }),
+  );
+  jiti = createJiti(join(process.cwd(), "tests", "native-virtual-models.test.ts"), {
+    interopDefault: false,
+    moduleCache: false,
+  });
+  extension = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+  t = extension.__internals_for_tests;
+});
+
+after(async () => {
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  for (const [name, value] of previousOptimizerEnv) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  await rm(agentDir, { recursive: true, force: true });
+});
+
+type TestModel = {
+  provider: string;
+  id: string;
+  name: string;
+  api: string;
+  baseUrl: string;
+  compat?: Record<string, unknown>;
+  reasoning: boolean;
+  input: Array<"text" | "image">;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+};
+
+function physical(provider: string, id: string, overrides: Partial<TestModel> = {}): TestModel {
+  return {
+    provider,
+    id,
+    name: id,
+    api: "openai-completions",
+    baseUrl: "https://proxy.example/v1",
+    compat: {},
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8192,
+    ...overrides,
+  };
+}
+
+function virtualModel(provider = "jev", id = "auto", name = "Auto"): TestModel {
+  return { ...physical(provider, id), name, api: "pi-virtual", baseUrl: "", compat: undefined };
+}
+
+function assistantEntry(provider: string, model: string, api: string, extra: Record<string, unknown> = {}) {
+  return { type: "message", message: { role: "assistant", provider, model, api, stopReason: "stop", ...extra } };
+}
+
+function context(
+  model: TestModel,
+  options: { branch?: unknown[]; available?: TestModel[]; all?: TestModel[]; sessionId?: string } = {},
+  ui: { statuses?: Array<string | undefined>; notifications?: string[] } = {},
+) {
+  const available = options.available ?? [];
+  const all = options.all ?? available;
+  return {
+    model,
+    hasUI: true,
+    sessionManager: {
+      getSessionId: () => options.sessionId ?? "native-virtual-session",
+      getBranch: () => options.branch ?? [],
+    },
+    modelRegistry: {
+      find: (provider: string, id: string) => all.find((candidate) => candidate.provider === provider && candidate.id === id),
+      getAvailable: () => available,
+      getAll: () => all,
+    },
+    ui: {
+      notify: (text: string) => ui.notifications?.push(text),
+      setStatus: (_key: string, text: string | undefined) => ui.statuses?.push(text),
+    },
+  } as any;
+}
+
+function setup() {
+  const hooks = new Map<string, (event: any, ctx: any) => unknown>();
+  const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  extension.default({
+    on(name: string, handler: (event: any, ctx: any) => unknown) {
+      hooks.set(name, handler);
+    },
+    registerCommand(name: string, command: any) {
+      commands.set(name, command);
+    },
+  } as any);
+  return { hooks, commands };
+}
+
+describe("native virtual model contracts", () => {
+  test("installed Pi marks native virtual models with the pi-virtual API", async () => {
+    const piVirtual = await jiti.import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/virtual-models.js")>(
+      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "virtual-models.js"),
+    );
+    assert.equal(t.PI_VIRTUAL_MODEL_API, piVirtual.VIRTUAL_MODEL_API);
+    const created = piVirtual.createVirtualModel({ provider: "jev", id: "auto", name: "Auto" });
+    assert.equal(piVirtual.isVirtualModel(created), true);
+    assert.equal(t.isNativeVirtualModel(created), true);
+    assert.equal(t.isNativeVirtualModel(physical("proxy", "kimi-k3")), false);
+
+    const piRuntimeModule = await jiti.import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/model-runtime.js")>(
+      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "model-runtime.js"),
+    );
+    const runtimeDir = await mkdtemp(join(tmpdir(), "pi-cache-native-virtual-runtime-"));
+    try {
+      await writeFile(join(runtimeDir, "models.json"), JSON.stringify({ providers: {} }));
+      const runtime = await piRuntimeModule.ModelRuntime.create({
+        modelsPath: join(runtimeDir, "models.json"),
+        authPath: join(runtimeDir, "auth.json"),
+        modelsStorePath: join(runtimeDir, "models-store.json"),
+        allowModelNetwork: false,
+        refreshOnCreate: false,
+      });
+      runtime.registerVirtualModel({ provider: "jev", id: "auto", name: "Auto", route: () => { throw new Error("not routed in this test"); } });
+      const registered = runtime.getModel("jev", "auto");
+      assert.ok(registered);
+      assert.equal(t.isNativeVirtualModel(registered), true);
+      assert.equal(t.isVirtualRoutingModel(registered as any), true);
+    } finally {
+      // ModelRuntime may still be persisting its store file asynchronously.
+      await rm(runtimeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  test("branch resolution follows the latest physical response like Pi", () => {
+    const branch = [
+      assistantEntry("old-proxy", "glm-5.2", "openai-completions"),
+      assistantEntry("jev", "auto", "pi-virtual", { stopReason: "error" }),
+      { type: "model_change", provider: "jev", modelId: "auto" },
+      assistantEntry("proxy", "kimi-k3", "openai-completions", { responseModel: "kimi-k3-0930" }),
+      assistantEntry("fallback-proxy", "deepseek-v4-pro", "openai-completions", { stopReason: "error" }),
+    ];
+    const dispatches = t.findNativeVirtualDispatches(context(virtualModel(), { branch }));
+    // The catalog id in `message.model` wins over the echoed responseModel.
+    assert.deepEqual(dispatches.latestSuccessful, { provider: "proxy", id: "kimi-k3", api: "openai-completions" });
+    assert.deepEqual(dispatches.latestAny, { provider: "fallback-proxy", id: "deepseek-v4-pro", api: "openai-completions" });
+
+    const kimi = physical("proxy", "kimi-k3", { name: "Kimi K3" });
+    const routed = t.resolveNativeVirtualRouteModel(virtualModel() as any, context(virtualModel(), { branch, all: [kimi] }));
+    assert.equal(routed?.name, "Kimi K3");
+    assert.equal(routed?.baseUrl, "https://proxy.example/v1");
+    assert.equal(t.resolveRouteModel(virtualModel() as any, context(virtualModel(), { branch, all: [kimi] }))?.id, "kimi-k3");
+
+    // Physical selections and hosts without getBranch() keep legacy behavior.
+    assert.equal(t.resolveNativeVirtualRouteModel(kimi as any, context(kimi, { branch })), undefined);
+    assert.equal(t.resolveNativeVirtualRouteModel(virtualModel() as any, { sessionManager: { getSessionId: () => "s" } } as any), undefined);
+  });
+
+  test("request resolution matches the dispatched payload id and fails closed on conflicting providers", () => {
+    const kimi = physical("proxy", "kimi-k3");
+    const openai = physical("openai", "gpt-6.1-sol", { api: "openai-responses", baseUrl: "https://api.openai.com/v1" });
+    const codex = physical("openai-codex", "gpt-6.1-sol", { api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" });
+    const zen = physical("opencode", "deepseek-v4-pro", { baseUrl: "https://opencode.example/zen/v1" });
+    const go = physical("opencode-go", "deepseek-v4-pro", { baseUrl: "https://opencode.example/zen/v1" });
+    const policy = (candidate: any) => JSON.stringify([candidate.api, candidate.baseUrl]);
+    const selected = virtualModel();
+    const branch = [assistantEntry("proxy", "kimi-k3", "openai-completions")];
+    const resolve = (payload: unknown, available: TestModel[], all = available) =>
+      t.resolveNativeVirtualRequestModel(selected as any, payload, context(selected, { branch, available, all }), policy);
+
+    assert.deepEqual(
+      [resolve({ model: "kimi-k3" }, [kimi, openai])?.model.provider, resolve({ model: "kimi-k3" }, [kimi])?.identityAmbiguous],
+      ["proxy", false],
+    );
+    // A router switch to another credentialed model is recognized from the payload.
+    assert.equal(resolve({ model: "gpt-6.1-sol" }, [kimi, openai])?.model.provider, "openai");
+    // A shared id with identical request treatment resolves but stays ambiguous.
+    assert.deepEqual(
+      [resolve({ model: "deepseek-v4-pro" }, [zen, go])?.model.id, resolve({ model: "deepseek-v4-pro" }, [zen, go])?.identityAmbiguous],
+      ["deepseek-v4-pro", true],
+    );
+    // Providers with different request treatment are never guessed.
+    assert.equal(resolve({ model: "gpt-6.1-sol" }, [openai, codex]), undefined);
+    // Without a credentialed match, the sticky branch candidate is used.
+    assert.deepEqual(
+      [resolve({ model: "kimi-k3" }, [], [kimi])?.model.provider, resolve({ model: "kimi-k3" }, [], [kimi])?.identityAmbiguous],
+      ["proxy", false],
+    );
+    assert.equal(resolve({ model: "unknown" }, [kimi]), undefined);
+    assert.equal(resolve({ messages: [] }, [kimi]), undefined);
+    assert.equal(t.getProviderPayloadModelId({ modelId: "anthropic.claude-sonnet-5-5" }), "anthropic.claude-sonnet-5-5");
+    assert.equal(t.resolveNativeVirtualRequestModel(kimi as any, { model: "kimi-k3" }, context(kimi, { available: [kimi] }), policy), undefined);
+  });
+});
+
+describe("native virtual model hooks", () => {
+  test("request hook applies the routed physical model's request policy", async () => {
+    const { hooks } = setup();
+    const selected = virtualModel();
+    const proxy = physical("proxy", "kimi-k3");
+    const openai = physical("openai", "gpt-6.1-sol", { api: "openai-responses", baseUrl: "https://api.openai.com/v1" });
+    const codex = physical("openai-codex", "gpt-6.1-sol", { api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" });
+    const claude = physical("anthropic", "claude-sonnet-5.5", { api: "anthropic-messages", baseUrl: "https://api.anthropic.com" });
+    const omitted = physical("strict-proxy", "omit-model");
+    const send = async (payload: any, available: TestModel[]) => {
+      const result = await hooks.get("before_provider_request")!({ payload }, context(selected, { available }));
+      return result ?? payload;
+    };
+
+    const toProxy = await send({ model: "kimi-k3", messages: [], prompt_cache_retention: "24h" }, [proxy]);
+    assert.equal(toProxy.prompt_cache_key, "native-virtual-session");
+    assert.equal(toProxy.prompt_cache_retention, undefined);
+
+    const toOpenAI = await send({ model: "gpt-6.1-sol", input: [], prompt_cache_retention: "24h", prompt_cache_key: "pi-key" }, [openai]);
+    assert.equal(toOpenAI.prompt_cache_retention, "24h");
+    assert.equal(toOpenAI.prompt_cache_key, "pi-key");
+
+    const toClaude = await send({
+      model: "claude-sonnet-5.5",
+      system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+      messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+    }, [claude]);
+    assert.equal(toClaude.messages[0].content[0].cache_control.ttl, undefined);
+
+    const toOmitted = await send({ model: "omit-model", messages: [], prompt_cache_key: "pi-key" }, [omitted]);
+    assert.equal("prompt_cache_key" in toOmitted, false);
+
+    // A shared id across providers with different policies fails closed.
+    const ambiguous = await send({ model: "gpt-6.1-sol", input: [], prompt_cache_retention: "24h" }, [openai, codex]);
+    assert.equal(ambiguous.prompt_cache_retention, undefined);
+    assert.equal(ambiguous.prompt_cache_key, undefined);
+  });
+
+  test("session-affinity header bridge fails closed for native virtual selections", async () => {
+    const modelsPath = join(agentDir, "models.json");
+    await writeFile(modelsPath, JSON.stringify({ providers: { proxy: { compat: { sendSessionAffinityHeaders: true } } } }));
+    try {
+      const { hooks } = setup();
+      const proxy = physical("proxy", "kimi-k3");
+      const direct: Record<string, string> = {};
+      await hooks.get("before_provider_headers")!({ headers: direct }, context(proxy));
+      assert.ok(direct["x-session-affinity"], "direct physical selection is bridged");
+
+      const routed: Record<string, string> = {};
+      const branch = [assistantEntry("proxy", "kimi-k3", "openai-completions")];
+      await hooks.get("before_provider_headers")!({ headers: routed }, context(virtualModel(), { branch, all: [proxy] }));
+      assert.deepEqual(routed, {});
+    } finally {
+      await rm(modelsPath, { force: true });
+    }
+  });
+
+  test("footer and stats follow the physical model a virtual selection routed to", async () => {
+    const { hooks, commands } = setup();
+    const statuses: Array<string | undefined> = [];
+    const notifications: string[] = [];
+    const kimi = physical("proxy", "kimi-k3", { name: "Kimi K3" });
+    const selected = virtualModel();
+    const message = {
+      role: "assistant",
+      provider: "proxy",
+      model: "kimi-k3",
+      api: "openai-completions",
+      stopReason: "stop",
+      usage: { input: 200, output: 10, cacheRead: 800, cacheWrite: 0, totalTokens: 1010, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    const options = { sessionId: "footer-session", all: [kimi], available: [kimi] };
+    const startCtx = context(selected, options, { statuses, notifications });
+    const routedCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses, notifications });
+
+    await hooks.get("session_start")!({ reason: "startup" }, startCtx);
+    await hooks.get("message_end")!({ message }, routedCtx);
+    const routedStatus = statuses.at(-1);
+    assert.match(routedStatus ?? "", /^· Kimi cache 1\/1·/);
+
+    // Later lifecycle refreshes resolve the same physical model instead of
+    // clearing the footer for the virtual selection.
+    await hooks.get("agent_settled")!({}, routedCtx);
+    assert.equal(statuses.at(-1), routedStatus);
+
+    await commands.get("cache-optimizer")!.handler("stats", routedCtx);
+    assert.ok(notifications.at(-1)?.includes("proxy/kimi-k3"));
+    assert.ok(!notifications.at(-1)?.includes("jev/auto"));
+    await hooks.get("session_shutdown")!({}, routedCtx);
+
+    // After /reload, a fresh instance has no cached footer text; it must
+    // resolve the routed physical model from the session branch alone.
+    const reloaded = setup();
+    const reloadStatuses: Array<string | undefined> = [];
+    const reloadCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses: reloadStatuses });
+    await reloaded.hooks.get("session_start")!({ reason: "reload" }, reloadCtx);
+    assert.match(reloadStatuses.at(-1) ?? "", /^· Kimi cache 1\/1·/);
+    await reloaded.hooks.get("session_shutdown")!({}, reloadCtx);
+  });
+
+  test("an unrouted native virtual selection never keys stats by its virtual id", async () => {
+    const { hooks, commands } = setup();
+    const statuses: Array<string | undefined> = [];
+    const notifications: string[] = [];
+    // The display name contains an adapter token; the selection still has no
+    // physical cache identity until Pi routes a request.
+    const selected = virtualModel("jev", "deepseek-auto", "DeepSeek Auto");
+    const ctx = context(selected, { sessionId: "unrouted-session" }, { statuses, notifications });
+
+    await hooks.get("agent_settled")!({}, ctx);
+    assert.deepEqual(statuses.filter((status) => status !== undefined), []);
+
+    await commands.get("cache-optimizer")!.handler("compat", ctx);
+    assert.match(notifications.at(-1) ?? "", /Native virtual model: Pi routes each request/);
+  });
+
+  test("doctor and compat name the virtual selection and its routed physical model", async () => {
+    const { commands } = setup();
+    const notifications: string[] = [];
+    const kimi = physical("proxy", "kimi-k3", { name: "Kimi K3" });
+    const branch = [assistantEntry("proxy", "kimi-k3", "openai-completions")];
+    const ctx = context(virtualModel(), { branch, all: [kimi], sessionId: "doctor-session" }, { notifications });
+
+    await commands.get("cache-optimizer")!.handler("doctor", ctx);
+    assert.match(notifications.at(-1) ?? "", /Native virtual model jev\/auto → latest routed physical model proxy\/kimi-k3/);
+    assert.match(notifications.at(-1) ?? "", /Provider: proxy/);
+
+    await commands.get("cache-optimizer")!.handler("compat", ctx);
+    assert.match(notifications.at(-1) ?? "", /^🔀 Native virtual model jev\/auto/);
+  });
+
+  test("native virtual selections keep Pi's system prompt unchanged", async () => {
+    const { hooks } = setup();
+    const systemPrompt = [
+      "You are a coding assistant.",
+      "<session-overview>",
+      "Branch: main",
+      "## RECENT COMMITS",
+      "abc123 changed something",
+      "## PATHS",
+      "Tasks: .trellis/tasks/",
+      "</session-overview>",
+    ].join("\n");
+    const event = { systemPrompt, systemPromptOptions: { cwd: "/tmp", contextFiles: [], skills: [] } };
+    const proxy = physical("proxy", "kimi-k3");
+
+    const direct = await hooks.get("before_agent_start")!(event, context(proxy)) as { systemPrompt?: string };
+    assert.ok(direct.systemPrompt && !direct.systemPrompt.includes("RECENT COMMITS"), "physical selection is optimized");
+
+    const routed = await hooks.get("before_agent_start")!(event, context(virtualModel(), { branch: [assistantEntry("proxy", "kimi-k3", "openai-completions")], all: [proxy] }));
+    assert.deepEqual(routed, {});
+  });
+
+  test("nested codemode tool calls do not refresh the footer on their own", async () => {
+    const { hooks } = setup();
+    const statuses: Array<string | undefined> = [];
+    const ctx = context(physical("proxy", "kimi-k3", { name: "Kimi K3" }), { sessionId: "nested-session" }, { statuses });
+
+    await hooks.get("tool_execution_end")!({ toolCallId: "nested", toolName: "read", parentToolCallId: "codemode-1", isError: false }, ctx);
+    assert.equal(statuses.length, 0);
+
+    await hooks.get("tool_execution_end")!({ toolCallId: "codemode-1", toolName: "codemode", isError: false }, ctx);
+    assert.equal(statuses.length, 1);
+    assert.match(statuses[0] ?? "", /^· Kimi cache 0\/0/);
+  });
+
+  test("provider request lifecycle records stay bounded", () => {
+    const states = [
+      { id: "pending-1", responseReceived: false },
+      { id: "warm-done", responseReceived: true },
+      { id: "pending-2", responseReceived: false },
+      { id: "done", responseReceived: true },
+    ];
+    t.pruneProviderRequestStates(states, 2);
+    assert.deepEqual(states.map((state) => state.id), ["pending-1", "pending-2"]);
+
+    const pending = [{ id: "a", responseReceived: false }, { id: "b", responseReceived: false }];
+    t.pruneProviderRequestStates(pending, 1);
+    assert.deepEqual(pending.map((state) => state.id), ["b"]);
+  });
+});

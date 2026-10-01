@@ -135,5 +135,6 @@ Tests should assert external behavior and protocol behavior, not private impleme
 - Assert provider/model/session counters stay separate.
 - Assert state migrations preserve valid data and drop malformed data.
 - Assert OpenAI cache-key injection is enabled-by-default but opt-outable, API-gated, session-id sourced, and does not override existing keys.
+- When code recognizes a Pi built-in provider by its explicit compat fingerprint (for example `llama.cpp`), build the positive fixture from the installed Pi provider implementation, not a hand-written literal, so a host upgrade that changes the shape fails `npm test` instead of silently disabling the exemption. The same applies to other host strings the extension matches exactly: the verbose skills block (`formatSkillsForPrompt`) and the native virtual model API (`VIRTUAL_MODEL_API`) are pinned to the installed Pi exports.
 - Assert routing-provider helpers use message metadata for final stats and registry data only for live UX.
 - Run `git diff --check` and `npm pack --dry-run` before release.

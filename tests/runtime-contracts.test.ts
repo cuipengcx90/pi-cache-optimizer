@@ -208,6 +208,78 @@ describe("OpenAI-compatible request contracts", () => {
     }
   });
 
+  test("installed Pi built-in llama.cpp models match the untouched fingerprint exemption", async () => {
+    // Hermetic agent dir: a developer's real models.json must not change the
+    // effective compat seen by the fingerprint.
+    const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-llama-fingerprint-test-"));
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      const jiti = createJiti(join(process.cwd(), "tests", "llama-fingerprint-test.ts"), { interopDefault: false, moduleCache: false });
+      const fresh = await jiti.import<typeof import("../index.ts")>(join(process.cwd(), "index.ts"));
+      const llamaModule = await jiti.import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/extensions/llama/provider.js")>(
+        join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "extensions", "llama", "provider.js"),
+      );
+      const t = fresh.__internals_for_tests;
+      const controller = llamaModule.createLlamaProvider();
+      controller.setCatalog([{ id: "qwen-local", status: { value: "loaded" }, meta: { n_ctx: 32_768 } }], llamaModule.DEFAULT_LLAMA_SERVER_URL);
+      const [builtIn] = controller.provider.getModels();
+      assert.ok(builtIn);
+      assert.equal(builtIn.provider, "llama.cpp");
+      assert.equal(builtIn.api, "openai-completions");
+
+      // The real provider shape from the installed Pi is exempt from generic
+      // proxy routing/session-affinity advice, even on a non-official base URL.
+      assert.equal(t.isPiBuiltInLlamaCppModel(builtIn), true);
+      assert.deepEqual(t.describeMissingOpenAICompatibleProxyCompat(builtIn), []);
+
+      // Pi 0.82.x reported supportsUsageInStreaming: false; Pi 0.83+ reports
+      // true. Streaming usage is not routing configuration, so both host
+      // shapes inside the supported peer range must stay recognized.
+      for (const supportsUsageInStreaming of [false, true]) {
+        assert.equal(
+          t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, supportsUsageInStreaming } }),
+          true,
+          `supportsUsageInStreaming: ${supportsUsageInStreaming}`,
+        );
+      }
+
+      // Same-id providers with routing/cache overrides or a different
+      // transport fingerprint remain ordinary OpenAI-compatible channels.
+      for (const [name, compat] of Object.entries({
+        sessionAffinity: { sendSessionAffinityHeaders: true },
+        sessionAffinityFormat: { sessionAffinityFormat: "openai" },
+        longRetention: { supportsLongCacheRetention: true },
+        developerRole: { supportsDeveloperRole: true },
+      })) {
+        assert.equal(t.isPiBuiltInLlamaCppModel({ ...builtIn, compat: { ...builtIn.compat, ...compat } } as PiModel), false, name);
+      }
+      assert.deepEqual(
+        t.describeMissingOpenAICompatibleProxyCompat({ ...builtIn, compat: { ...builtIn.compat, supportsDeveloperRole: true } }),
+        ["sendSessionAffinityHeaders"],
+      );
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      await rm(tempAgentDir, { recursive: true, force: true });
+    }
+  });
+
+  test("skill compression anchors on the installed Pi skills formatter", async () => {
+    // compressSkillsInSystemPrompt only substitutes an exact copy of Pi's
+    // verbose skills block. Drift would silently disable compression.
+    const piSkills = await createJiti(join(process.cwd(), "tests", "skills-format-test.ts"), { interopDefault: false, moduleCache: false }).import<typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/skills.js")>(
+      join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "skills.js"),
+    );
+    const sourceInfo = { path: "/skills/alpha/SKILL.md", source: "local", scope: "user", origin: "top-level" };
+    const skills = [
+      { name: "alpha", description: "Alpha <xml> & \"quotes\"", filePath: "/skills/alpha/SKILL.md", baseDir: "/skills/alpha", sourceInfo, disableModelInvocation: false },
+      { name: "beta", description: "Beta", filePath: "/project/.pi/skills/beta/SKILL.md", baseDir: "/project/.pi/skills/beta", sourceInfo, disableModelInvocation: false },
+      { name: "hidden", description: "Hidden", filePath: "/skills/hidden/SKILL.md", baseDir: "/skills/hidden", sourceInfo, disableModelInvocation: true },
+    ] as any;
+    assert.equal(internals.formatSkillsForPrompt(skills), piSkills.formatSkillsForPrompt(skills));
+  });
+
   test("installed Pi registerProvider drops lower provider compat for extension-owned models", async () => {
     const tempAgentDir = await mkdtemp(join(tmpdir(), "pi-cache-extension-provider-model-test-"));
     try {
