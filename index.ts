@@ -1335,6 +1335,43 @@ function resolveActiveRouteSnapshot(
   }
 }
 
+function resolveNativeVirtualCandidateModels(
+  model: PiModel | undefined,
+  ctx?: ContextWithOptionalModelRegistry,
+): PiModel[] | undefined {
+  if (!isNativeVirtualModel(model)) return undefined;
+  const adapter = model ? getRoutingRegistry()?.getRouter(model.provider) : undefined;
+  if (!adapter?.resolveCandidateRoutes) return undefined;
+
+  try {
+    const rawSnapshots = adapter.resolveCandidateRoutes(model.id);
+    if (!Array.isArray(rawSnapshots) || rawSnapshots.length === 0) return undefined;
+    const candidates: PiModel[] = [];
+    for (const rawSnapshot of rawSnapshots) {
+      const snapshot = parseRouteSnapshot(rawSnapshot, model.provider, model.id);
+      if (!snapshot) return undefined;
+      const candidate = findModelInRegistry(ctx?.modelRegistry, snapshot.provider, snapshot.modelId)
+        ?? routeSnapshotToPiModel(snapshot, model);
+      if (!isNonEmptyString(candidate.api)) return undefined;
+      candidates.push(candidate);
+    }
+    return candidates;
+  } catch {
+    return undefined;
+  }
+}
+
+function canRewriteNativeVirtualPrompt(
+  model: PiModel | undefined,
+  ctx?: ContextWithOptionalModelRegistry,
+): boolean {
+  if (!isNativeVirtualModel(model) || !isEnabledEnv(process.env[VIRTUAL_REWRITE_ENV])) return false;
+  const candidates = resolveNativeVirtualCandidateModels(model, ctx);
+  return !!candidates?.length && candidates.every((candidate) =>
+    candidate.api === "openai-completions" || candidate.api === "anthropic-messages",
+  ) && candidates.every((candidate) => !isResponsesPromptRewriteBypassApi(candidate.api));
+}
+
 function routeSnapshotToPiModel(snapshot: PiRouteSnapshot, fallback?: PiModel): PiModel {
   const sameIdentity = fallback?.provider === snapshot.provider && fallback?.id === snapshot.modelId;
   return {
@@ -10142,7 +10179,6 @@ export const __internals_for_tests = {
   MIN_STABLE_CANDIDATE_LENGTH,
   SKILL_COMPRESSION_MIN_COUNT,
   NO_PROMPT_REWRITE_ENV,
-  VIRTUAL_REWRITE_ENV,
   isEnabledEnv,
   // OpenAI-family cache-key helpers
   addOpenAIPromptCacheKey,
@@ -10162,6 +10198,8 @@ export const __internals_for_tests = {
   normalizeAnthropicCacheControlTtlOrder,
   isPiBuiltInLlamaCppModel,
   isResponsesPromptRewriteBypassApi,
+  canRewriteNativeVirtualPrompt,
+  VIRTUAL_REWRITE_ENV,
   isMistralConversationsApi,
   isOpenAIFamilyModel,
   isOpenAIFamilyAssistantMessage,
@@ -11204,7 +11242,7 @@ export default function (pi: ExtensionAPI) {
     // after this system prompt is built, so the bypass above cannot be decided
     // here. A route may reach the safety-filtered Codex backend; keep Pi's
     // prompt byte-for-byte instead of reordering it.
-    if (isNativeVirtualModel(_ctx.model) && !isEnabledEnv(process.env[VIRTUAL_REWRITE_ENV])) {
+    if (isNativeVirtualModel(_ctx.model) && !canRewriteNativeVirtualPrompt(_ctx.model, _ctx)) {
       return {};
     }
 

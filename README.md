@@ -92,7 +92,7 @@ The interactive `/cache-optimizer` menu includes `Footer mode`, where you can ch
 | Env var | Effect |
 |---|---|
 | `PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE=1` | Disable prompt mutations only; footer stats and cache-key fallback remain active. |
-| `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` | Allow prompt rewriting for Pi 0.99+ virtual selections (off by default). Enable only when no candidate in the routing chain can reach a safety-filtered Codex backend. |
+| `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` | Explicitly allow native virtual prompt rewriting only when the routing registry exposes a non-Responses, non-Codex candidate chain. Unknown or incomplete routes remain unchanged. |
 | `PI_CACHE_OPTIMIZER_NO_SKILL_COMPRESSION=1` | Keep Pi's verbose skill XML. |
 | `PI_CACHE_OPTIMIZER_NO_OPENAI_CACHE_KEY=1` | Disable the OpenAI-compatible `prompt_cache_key` fallback. Preferred explicit opt-out. |
 | `PI_CACHE_OPTIMIZER_OPENAI_CACHE_KEY=0` | Disable the same fallback via the legacy inverse switch. Values `0`, `false`, `no`, or `off` disable it. |
@@ -368,12 +368,14 @@ Pi 0.99 lets extensions register virtual models with `pi.registerVirtualModel()`
 - Request hooks read the dispatched model id from the provider payload and match it against physical models with configured credentials. The `prompt_cache_key` fallback, `prompt_cache_retention` safety, Anthropic TTL repair, and per-model `prompt_cache_key` omit rules then apply to that physical model. If several credentialed providers share the id and would be treated differently, the extension does not guess; identity-dependent request changes are skipped.
 - Footer stats and `/cache-optimizer doctor`, `compat`, `stats`, `reset`, and `fix` use the physical model that answered last on the current session branch, matching Pi's own routed-model display and context limits. Doctor and compat name both the virtual selection and that physical model.
 - Before Pi routes the first request, the footer stays empty and diagnostics ask you to send a prompt first.
-- Prompt rewriting is skipped for virtual selections by default: Pi picks the physical model after the system prompt is built, and a reordered prompt must not reach a safety-filtered Codex route. Set `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` to opt in when every candidate in the routing chain is known to be safe.
+- Prompt rewriting is skipped for virtual selections by default: Pi picks the physical model after the system prompt is built, and a reordered prompt must not reach a safety-filtered Codex route. `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` is an explicit opt-in only when the routing registry exposes a complete candidate chain and every candidate is a known non-Responses, non-Codex transport; unknown or incomplete routes remain unchanged.
 - The session-affinity header bridge is skipped as well, because Pi builds request headers before the payload exists. Pi still sends the physical model's own configured affinity headers.
 
 ## For router / virtual-channel extension authors
 
-If your Pi extension provides a virtual routing provider (for example `router/auto`, `router/smart`, or a profile/channel that forwards to a real upstream), this extension can show cache stats for the real upstream provider/model instead of the virtual shell. Integration is optional, versioned, and does **not** require importing this package.
+If your Pi extension provides a virtual routing provider (for example [`pi-router`](https://github.com/jiangge/pi-router)'s `router/auto`, `router/smart`, or a profile/channel that forwards to a real upstream), this extension can show cache stats for the real upstream provider/model instead of the virtual shell. Integration is optional, versioned, and does **not** require importing this package.
+
+For [`pi-router`](https://github.com/jiangge/pi-router), use a current release that implements `pi.routing.registry.v1`. Direct `router/*` selections continue to use the normal prompt optimizer. When a native Pi 0.99+ virtual model is routed through a registry-aware router, the optional `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` path inspects the router's candidate chain before rewriting; candidates using OpenAI Responses/Codex APIs, incomplete metadata, and unavailable route information fail closed.
 
 ### Minimum integration: final assistant message metadata
 

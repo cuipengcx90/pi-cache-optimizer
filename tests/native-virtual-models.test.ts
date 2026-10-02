@@ -235,6 +235,74 @@ describe("native virtual model contracts", () => {
 });
 
 describe("native virtual model hooks", () => {
+  test("native virtual prompt rewrite requires an explicit safe candidate chain", async () => {
+    const { hooks } = setup();
+    const selected = virtualModel("router", "auto");
+    const registry = Symbol.for("pi.routing.registry.v1");
+    const previous = (globalThis as any)[registry];
+    const install = (api: string) => {
+      (globalThis as any)[registry] = {
+        version: 1,
+        registerRouter() { return () => {}; },
+        getRouter() {
+          return {
+            virtualProvider: "router",
+            resolveActiveRoute() { return undefined; },
+            resolveCandidateRoutes() {
+              return [{ virtualProvider: "router", virtualModelId: "auto", provider: "proxy", modelId: "kimi-k3", api, timestamp: 1 }];
+            },
+          };
+        },
+      };
+    };
+    const event = {
+      systemPrompt: [
+        "stable project instructions",
+        "<session-overview>",
+        "## RECENT COMMITS",
+        "abc123 changed something",
+        "</session-overview>",
+      ].join("\n"),
+      systemPromptOptions: { cwd: "/tmp", contextFiles: [], skills: [] },
+    };
+    try {
+      process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = "1";
+      const proxy = physical("proxy", "kimi-k3", { api: "openai-completions" });
+      install("openai-completions");
+      const allowed = await hooks.get("before_agent_start")!(event, context(selected, { all: [proxy] })) as any;
+      assert.equal(typeof allowed?.systemPrompt, "string");
+
+      install("openai-responses");
+      const responses = physical("proxy", "kimi-k3", { api: "openai-responses" });
+      const blockedResponses = await hooks.get("before_agent_start")!(event, context(selected, { all: [responses] }));
+      assert.deepEqual(blockedResponses, {});
+
+      install("openai-codex-responses");
+      const codex = physical("proxy", "kimi-k3", { api: "openai-codex-responses" });
+      const blockedCodex = await hooks.get("before_agent_start")!(event, context(selected, { all: [codex] }));
+      assert.deepEqual(blockedCodex, {});
+    } finally {
+      delete process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE;
+      if (previous === undefined) delete (globalThis as any)[registry];
+      else (globalThis as any)[registry] = previous;
+    }
+  });
+
+  test("native virtual prompt rewrite fails closed without candidate route metadata", async () => {
+    const { hooks } = setup();
+    const selected = virtualModel("unregistered", "auto");
+    process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = "1";
+    try {
+      const result = await hooks.get("before_agent_start")!({
+        systemPrompt: "stable project instructions",
+        systemPromptOptions: { cwd: "/tmp", contextFiles: [], skills: [] },
+      }, context(selected));
+      assert.deepEqual(result, {});
+    } finally {
+      delete process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE;
+    }
+  });
+
   test("native virtual requests fail closed instead of reusing stale branch routing", async () => {
     const { hooks } = setup();
     const selected = virtualModel();
@@ -451,33 +519,6 @@ describe("native virtual model hooks", () => {
     assert.deepEqual(routed, {});
   });
 
-  test("virtual selections opt into prompt rewriting when the chain cannot reach Codex", async () => {
-    const { hooks } = setup();
-    const systemPrompt = [
-      "You are a coding assistant.",
-      "<session-overview>",
-      "Branch: main",
-      "## RECENT COMMITS",
-      "abc123 changed something",
-      "</session-overview>",
-    ].join("\n");
-    const event = { systemPrompt, systemPromptOptions: { cwd: "/tmp", contextFiles: [], skills: [] } };
-    const proxy = physical("proxy", "kimi-k3");
-
-    process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE = "1";
-    try {
-      const routed = await hooks.get("before_agent_start")!(
-        event,
-        context(virtualModel(), { branch: [assistantEntry("proxy", "kimi-k3", "openai-completions")], all: [proxy] }),
-      ) as { systemPrompt?: string };
-      assert.ok(
-        routed.systemPrompt && !routed.systemPrompt.includes("RECENT COMMITS"),
-        "virtual selection is optimized when explicitly opted in",
-      );
-    } finally {
-      delete process.env.PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE;
-    }
-  });
 
   test("nested codemode tool calls do not refresh the footer on their own", async () => {
     const { hooks } = setup();

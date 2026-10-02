@@ -56,7 +56,7 @@ Primary hooks/events:
 
 - Apply prompt rewrite pipeline only when runtime optimizer and env gates allow it.
 - Official OpenAI Responses/Codex prompt bypass must remain intact.
-- Skip every prompt mutation for a Pi 0.99+ native virtual selection (`ctx.model.api === "pi-virtual"`). Pi chooses the physical model per request after the system prompt is built, so the Responses/Codex bypass cannot be decided here.
+- Skip prompt mutation for a Pi 0.99+ native virtual selection (`ctx.model.api === "pi-virtual"`) by default. An explicit `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` opt-in may allow rewriting only when the routing registry exposes a complete candidate chain and every candidate is a known non-Responses, non-Codex transport; missing, malformed, unavailable, or unsafe candidates fail closed. Pi chooses the physical model per request after the system prompt is built, so the candidate safety gate is required.
 - Publish query-scoped cache hints through `Symbol.for("pi.cache.hints.v1")` when applicable.
 - Never persist prompt contents to disk.
 

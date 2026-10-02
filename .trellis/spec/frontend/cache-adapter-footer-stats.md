@@ -779,7 +779,12 @@ resolveNativeVirtualRequestModel(model, payload, ctx, requestPolicyKey?):
   NOT fall back to the latest branch route.
 * `before_provider_headers` adds nothing for a native virtual selection.
 * `before_agent_start` performs no prompt mutation for a native virtual
-  selection, because a route may reach the safety-filtered Codex backend.
+  selection by default, because a route may reach the safety-filtered Codex
+  backend. `PI_CACHE_OPTIMIZER_VIRTUAL_REWRITE=1` is an explicit opt-in only;
+  rewriting is allowed when the routing registry exposes a complete candidate
+  chain and every candidate resolves to a known non-Responses, non-Codex API.
+  Missing, malformed, unavailable, or unsafe candidate metadata MUST fail
+  closed and preserve the original prompt.
 * `message_end` resolves the message's dispatched catalog model through the
   registry for adapter tokens, the stats key, and the footer compat marker.
 * `selectAdapterForModel()` never matches a native virtual model: an unrouted
